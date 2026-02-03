@@ -36,15 +36,24 @@ update_panel_port() {
         return
     fi
 
-    local CURRENT_PORT=$(grep "PANEL_PORT=" "$SERVICE_FILE" | cut -d'=' -f2 | tr -d '"')
-    
+    local CURRENT_PORT=""
+    CURRENT_PORT=$(systemctl show "$SERVICE_NAME" --property=Environment 2>/dev/null \
+        | sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' | head -n1)
+
+    # fallback：直接从 service 文件抓数字
+    if [ -z "$CURRENT_PORT" ]; then
+        CURRENT_PORT=$(sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' "$SERVICE_FILE" 2>/dev/null | head -n1)
+    fi
+
+    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="(未知)"
+
     echo -e "--------------------"
     echo -e "修改 Web 面板访问端口"
     echo -e "当前端口: ${GREEN}${CURRENT_PORT}${RESET}"
     echo -e "--------------------"
-    
+
     read -p "请输入新的端口号 (1-65535): " new_port
-    
+
     # 合法性校验
     if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
         echo -e "${RED}输入无效，端口必须是 1 到 65535 之间的数字。${RESET}"
@@ -54,7 +63,7 @@ update_panel_port() {
 
     # 端口占用检测
     if command -v ss >/dev/null 2>&1; then
-        if ss -lntu | grep -q ":${new_port} "; then
+        if ss -lntu | awk '{print $5}' | grep -Eq "[:.]${new_port}$"; then
             echo -e "${RED}错误：端口 $new_port 似乎已被系统其他程序占用。${RESET}"
             read -p "按回车键返回..."
             return
@@ -62,17 +71,45 @@ update_panel_port() {
     fi
 
     echo -e "${YELLOW}正在更新配置...${RESET}"
-    sed -i "s|Environment=\"PANEL_PORT=.*\"|Environment=\"PANEL_PORT=$new_port\"|g" "$SERVICE_FILE"
-    systemctl daemon-reload
-    
-    if systemctl restart "$SERVICE_NAME"; then
-        echo -e "${GREEN}✅ 端口修改成功！面板已重启。${RESET}"
-        echo -e "新的访问地址: ${YELLOW}http://$(get_ip):${new_port}${RESET}"
+
+    # 确保 service 里存在 PANEL_PORT 行；不存在就追加
+    if ! grep -qE 'Environment="PANEL_PORT=' "$SERVICE_FILE"; then
+        # 追加到 [Service] 段里（简单做法：直接追加到文件末尾也能生效，但我这里尽量放进 Service 段）
+        awk -v np="$new_port" '
+            BEGIN{added=0}
+            /^\[Service\]/{print; if(!added){print "Environment=\"PANEL_PORT="np"\""; added=1; next}}
+            {print}
+            END{if(!added) print "Environment=\"PANEL_PORT="np"\""}
+        ' "$SERVICE_FILE" > /tmp/hipf-panel.service.tmp && mv /tmp/hipf-panel.service.tmp "$SERVICE_FILE"
     else
-        echo -e "${RED}❌ 修改失败，请检查日志。${RESET}"
+        sed -i -E 's/(Environment="PANEL_PORT=)[0-9]+(")/\1'"$new_port"'\2/' "$SERVICE_FILE"
     fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if systemctl restart "$SERVICE_NAME" >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ 端口修改成功！面板已重启。${RESET}"
+
+        # IP 获取：优先用你已有的 get_ip()；没有则用兜底
+        local SHOW_IP=""
+        if command -v get_ip >/dev/null 2>&1; then
+            SHOW_IP="$(get_ip)"
+        else
+            SHOW_IP="$(curl -s4 ifconfig.me/ip || curl -s6 ifconfig.me/ip || hostname -I | awk '{print $1}')"
+        fi
+
+        if [[ "$SHOW_IP" == *:* ]]; then
+            SHOW_IP="[$SHOW_IP]"
+        fi
+
+        echo -e "新的访问地址: ${YELLOW}http://${SHOW_IP}:${new_port}${RESET}"
+    else
+        echo -e "${RED}❌ 修改失败，请检查日志：journalctl -u ${SERVICE_NAME} -n 50 --no-pager${RESET}"
+    fi
+
     read -p "按回车键返回..."
 }
+
 
 # 4. 查看详细状态
 check_status() {
