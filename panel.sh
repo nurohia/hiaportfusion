@@ -51,7 +51,7 @@ run_step() {
 # =================环境准备与依赖安装=================
 
 install_dependencies() {
-    echo -e "${CYAN}>>> 正在安装 HAProxy, GOST 及编译环境...${RESET}"
+    run_step "正在安装 HAProxy, GOST 及编译环境" "
     
     # 1. 系统包
     if [ -f /etc/debian_version ]; then
@@ -265,11 +265,8 @@ async fn main() {
 }
 
 // --- 后端核心逻辑：HAProxy + GOST ---
-
 fn apply_backend_config(rules: &Vec<Rule>) {
-    // 1. 生成 HAProxy 配置 (TCP)
     let header = r#"global
-    daemon
     maxconn 10240
     log 127.0.0.1 local0 info
 defaults
