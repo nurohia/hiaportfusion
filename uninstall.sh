@@ -1,9 +1,12 @@
 #!/bin/bash
 
 # ================= 配置区域 =================
-# 必须与安装脚本路径保持一致
 PANEL_BIN="/usr/local/bin/hipf-panel"
 GOST_BIN="/usr/local/bin/gost"
+GOST_PRO_BIN="/usr/local/bin/hipf-gost-udp"
+GOST_OLD_BIN="/usr/local/bin/hipf-gost-server"
+GOST_WRAPPER="/usr/local/bin/hipf-gost-udp"
+
 DATA_DIR="/etc/hipf"
 HAPROXY_DIR="/etc/haproxy"
 SERVICE_FILE="/etc/systemd/system/hipf-panel.service"
@@ -38,27 +41,28 @@ if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     exit 0
 fi
 
-# 1. 停止并禁用服务
 info "正在停止服务和进程..."
 systemctl stop hipf-panel 2>/dev/null
 systemctl disable hipf-panel 2>/dev/null
 systemctl stop haproxy 2>/dev/null
+
 pkill -f "$GOST_BIN" 2>/dev/null
+pkill -x "hipf-gost-udp" 2>/dev/null
+pkill -x "hipf-gost-server" 2>/dev/null
+pkill -f "hipf-gost-udp" 2>/dev/null 
+
 success "服务已停止"
 
-# 2. 清理 iptables 规则 (高风险操作，需精确)
+
 info "正在清理 iptables 防火墙规则..."
-# 从主链解绑
 iptables -D INPUT -j HIPF_IN 2>/dev/null || true
 iptables -D FORWARD -j HIPF_IN 2>/dev/null || true
 iptables -D OUTPUT -j HIPF_OUT 2>/dev/null || true
 iptables -D FORWARD -j HIPF_OUT 2>/dev/null || true
-# 清空并删除自定义链
 iptables -F HIPF_IN 2>/dev/null || true
 iptables -X HIPF_IN 2>/dev/null || true
 iptables -F HIPF_OUT 2>/dev/null || true
 iptables -X HIPF_OUT 2>/dev/null || true
-# 持久化保存 (防止重启后恢复)
 if command -v iptables-save >/dev/null; then
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 fi
@@ -68,10 +72,12 @@ success "防火墙规则已清洗"
 info "正在删除文件残留..."
 rm -f "$PANEL_BIN"
 rm -f "$GOST_BIN"
+rm -f "$GOST_PRO_BIN"  
+rm -f "$GOST_OLD_BIN" 
 rm -f "$SERVICE_FILE"
 rm -rf "$DATA_DIR"
 rm -rf "/opt/hipf_panel"
-rm -rf "/opt/hipf_build" # 清理可能的编译目录
+rm -rf "/opt/hipf_build" 
 systemctl daemon-reload
 success "文件已删除"
 
@@ -93,7 +99,7 @@ else
 fi
 
 echo ""
-echo -e "${YELLOW}是否卸载 Rust 编译环境 (Cargo/Rustc)？${RESET}"
+echo -e "${YELLOW}是否卸载 Rust 编译环境？${RESET}"
 echo -e "${CYAN}(如果您服务器上还有其他 Rust 项目，请选择 n)${RESET}"
 read -p "输入 y 卸载，其他键保留 [y/n]: " rm_rust
 if [[ "$rm_rust" == "y" || "$rm_rust" == "Y" ]]; then
