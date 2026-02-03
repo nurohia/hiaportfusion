@@ -15,7 +15,6 @@ BINARY_PATH="/usr/local/bin/hipf-panel"
 SERVICE_FILE="/etc/systemd/system/hipf-panel.service"
 DATA_FILE="/etc/hipf/panel_data.json"
 GOST_BIN="/usr/local/bin/gost"
-# 【关键新增】必须与 Rust 代码 v1.0.7+ 中的常量一致
 GOST_PRO_BIN="/usr/local/bin/hipf-gost-udp"
 
 # 颜色定义
@@ -26,7 +25,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}    HiaPortFusion 面板 (Binary Release)   ${RESET}"
+echo -e "${GREEN}    HiaPortFusion 面板  ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
 if [ -f "$DATA_FILE" ] && [ -f "$SERVICE_FILE" ]; then
