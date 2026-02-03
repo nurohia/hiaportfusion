@@ -11,7 +11,8 @@ WORK_DIR="/opt/hipf_panel"
 PANEL_BIN="/usr/local/bin/hipf-panel"
 DATA_FILE="/etc/hipf/panel_data.json"
 HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
-GOST_BIN="/usr/local/bin/gost"
+GOST_RAW_BIN="/usr/local/bin/gost"
+GOST_PRO_BIN="/usr/local/bin/hipf-gost-udp"
 
 # 颜色与图标定义
 GREEN="\033[32m"
@@ -70,8 +71,8 @@ install_dependencies() {
         yum install -y haproxy ca-certificates curl wget tar git gcc gcc-c++ make pkgconfig openssl-devel iptables-services >/dev/null 2>&1
     fi
 
-    # 2. 安装 GOST (适配架构)
-    if [ ! -f "$GOST_BIN" ]; then
+    # 2. 安装 GOST 并创建专用副本
+    if [ ! -f "$GOST_RAW_BIN" ]; then
         ARCH=$(uname -m)
         case $ARCH in
             x86_64|amd64) GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz" ;;
@@ -80,10 +81,13 @@ install_dependencies() {
         esac
         wget -O /tmp/gost.tar.gz "$GOST_URL" >/dev/null 2>&1
         tar -xf /tmp/gost.tar.gz -C /tmp
-        mv /tmp/gost "$GOST_BIN"
-        chmod +x "$GOST_BIN"
+        mv /tmp/gost "$GOST_RAW_BIN"
+        chmod +x "$GOST_RAW_BIN"
         rm -f /tmp/gost.tar.gz
     fi
+
+    cp -f "$GOST_RAW_BIN" "$GOST_PRO_BIN"
+    chmod +x "$GOST_PRO_BIN"
 
     # 3. 安装 Rust
     if ! command -v cargo >/dev/null 2>&1; then
@@ -97,7 +101,6 @@ install_dependencies() {
     mkdir -p /etc/hipf
     mkdir -p "$(dirname $HAPROXY_CFG)"
     
-    # 确保 HAProxy 初始配置存在
     if [ ! -f "$HAPROXY_CFG" ] || [ ! -s "$HAPROXY_CFG" ]; then
         cat > "$HAPROXY_CFG" <<EOF
 global
@@ -127,14 +130,13 @@ fi
 clear
 echo -e "${GREEN}==========================================${RESET}"
 echo -e "${GREEN}   HiaPortFusion Panel (HAProxy+GOST)     ${RESET}"
-echo -e "${GREEN}   v1.0.3 (细节打磨+完美体验版)             ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
 # 1. 安装依赖
 install_dependencies
 
 # 2. 生成源码
-task_start "正在生成面板核心源码 (Rust Source)"
+task_start "正在生成面板源码 (Rust Source)"
 mkdir -p "$WORK_DIR/src"
 cd "$WORK_DIR"
 
@@ -142,7 +144,7 @@ cd "$WORK_DIR"
 cat > Cargo.toml <<EOF
 [package]
 name = "hipf-panel"
-version = "1.0.3"
+version = "1.0.8"
 edition = "2021"
 
 [dependencies]
@@ -171,10 +173,9 @@ use chrono::prelude::*;
 
 const DATA_FILE: &str = "/etc/hipf/panel_data.json";
 const HAPROXY_CFG: &str = "/etc/haproxy/haproxy.cfg";
-const GOST_BIN: &str = "/usr/local/bin/gost";
+const GOST_PRO_BIN: &str = "/usr/local/bin/hipf-gost-udp"; // 13 chars, safe for pkill -x
 const CHAIN_IN: &str = "HIPF_IN";
 const CHAIN_OUT: &str = "HIPF_OUT";
-const GOST_TAG: &str = "#HIPF-UDP"; 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Rule {
@@ -269,15 +270,38 @@ async fn main() {
         .layer(CookieManagerLayer::new())
         .with_state(state);
 
-    let port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "4794".to_string());
+    let port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "4796".to_string());
     println!("Server running on port {}", port);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-// --- 后端核心逻辑 ---
+
+fn normalize_addr(addr: &str) -> String {
+    if !addr.contains(':') {
+        return format!("0.0.0.0:{}", addr);
+    }
+    if addr.starts_with('[') {
+        return addr.to_string();
+    }
+    // Attempt to split host/port by last colon
+    if let Some((host, port)) = addr.rsplit_once(':') {
+        if host.contains(':') {
+            // Host part contains colon but no starting bracket -> needs bracket
+            return format!("[{}]:{}", host, port);
+        }
+    }
+    addr.to_string()
+}
+
+fn get_port(listen: &str) -> String {
+    listen.rsplit(':').next().unwrap_or(listen).trim().to_string()
+}
+
+
 
 fn apply_backend_config(rules: &Vec<Rule>) {
+    // 1. HAProxy (TCP)
     let header = r#"global
     daemon
     maxconn 10240
@@ -293,34 +317,41 @@ defaults
     
     for rule in rules {
         if rule.enabled {
-            let port = get_port(&rule.listen);
-            if port.is_empty() { continue; }
-            let actual_bind = if rule.listen.contains(':') { rule.listen.clone() } else { format!("0.0.0.0:{}", rule.listen) };
+            let bind_addr = normalize_addr(&rule.listen);
+            let remote_addr = normalize_addr(&rule.remote);
+
             config_content.push_str(&format!("listen hipf-{}\n", rule.id));
-            config_content.push_str(&format!("    bind {}\n", actual_bind));
-            config_content.push_str(&format!("    server s1 {}\n\n", rule.remote));
+            config_content.push_str(&format!("    bind {}\n", bind_addr));
+            config_content.push_str(&format!("    server s1 {}\n\n", remote_addr));
         }
     }
     
     let _ = fs::write(HAPROXY_CFG, config_content);
     let _ = Command::new("systemctl").arg("reload").arg("haproxy").status();
 
-    let _ = Command::new("pkill").arg("-f").arg(GOST_TAG).status();
+    // 2. GOST (UDP)
+    let _ = Command::new("pkill").arg("-x").arg("hipf-gost-udp").status();
     std::thread::sleep(Duration::from_millis(100));
 
     for rule in rules {
         if rule.enabled {
-            let port = get_port(&rule.listen);
-            if port.is_empty() { continue; }
-            let listen_ip = if rule.listen.contains(':') { rule.listen.split(':').next().unwrap_or("0.0.0.0") } else { "0.0.0.0" };
-            let gost_target = format!("udp://{}:{}/{}", listen_ip, port, rule.remote);
-            let cmd_str = format!("exec {} -L {} {}", GOST_BIN, gost_target, GOST_TAG);
-            Command::new("nohup").arg("sh").arg("-c").arg(cmd_str).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok();
+            let bind_addr = normalize_addr(&rule.listen);
+            let remote_addr = normalize_addr(&rule.remote);
+            
+            let gost_target = format!("udp://{}/{}", bind_addr, remote_addr);
+            
+            Command::new(GOST_PRO_BIN) 
+                .arg("-L")
+                .arg(gost_target)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
         }
     }
 }
 
-// --- iptables 流量统计逻辑 ---
 
 fn init_firewall_chains() {
     let _ = Command::new("iptables").args(["-N", CHAIN_IN]).status();
@@ -342,10 +373,6 @@ fn init_firewall_chains() {
 fn flush_iptables_chains() {
     let _ = Command::new("iptables").args(["-F", CHAIN_IN]).status();
     let _ = Command::new("iptables").args(["-F", CHAIN_OUT]).status();
-}
-
-fn get_port(listen: &str) -> String {
-    listen.split(':').last().unwrap_or(listen).trim().to_string()
 }
 
 fn add_iptables_rule(rule: &Rule) {
@@ -408,7 +435,6 @@ fn fetch_iptables_counters() -> HashMap<String, TrafficStats> {
     map
 }
 
-// --- 数据管理与 Auth ---
 
 fn update_traffic_and_check(state: &Arc<AppState>) {
     let current_counters = fetch_iptables_counters();
@@ -480,7 +506,7 @@ fn check_auth(cookies: &Cookies, state: &Arc<AppState>) -> bool {
     false
 }
 
-// 页面Handlers
+
 async fn index_page(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
     if !check_auth(&cookies, &state) { return axum::response::Redirect::to("/login").into_response(); }
     let data = state.data.lock().unwrap();
@@ -491,7 +517,6 @@ async fn index_page(cookies: Cookies, State(state): State<Arc<AppState>>) -> Res
     Html(html).into_response()
 }
 
-// 【修复 1】恢复读取 state 中的配置，确保登录页背景生效
 async fn login_page(State(state): State<Arc<AppState>>) -> Response {
     let data = state.data.lock().unwrap(); 
     let html = LOGIN_HTML
@@ -666,7 +691,6 @@ const LOGIN_HTML: &str = r#"
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><title>HiaPortFusion Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:url('{{BG_PC}}') no-repeat center center/cover;color:#374151}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.05)}.box{position:relative;z-index:2;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,0.4);box-shadow:0 8px 32px rgba(0,0,0,0.05);width:90%;max-width:380px;text-align:center}h2{margin-bottom:2rem;color:#374151;font-weight:600;letter-spacing:1px}input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,0.5);border-radius:12px;outline:none;background:rgba(255,255,255,0.5);transition:0.3s;color:#374151}input:focus{background:rgba(255,255,255,0.9);border-color:#3b82f6}button{width:100%;padding:14px;background:rgba(59,130,246,0.85);color:white;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem;transition:0.3s;backdrop-filter:blur(5px)}button:hover{background:#2563eb;transform:translateY(-1px)}</style></head><body><div class="overlay"></div><div class="box"><h2>HiaPortFusion</h2><form onsubmit="doLogin(event)"><input type="text" id="u" placeholder="Username" required><input type="password" id="p" placeholder="Password" required><button type="submit" id="btn">登 录</button></form></div><script>async function doLogin(e){e.preventDefault();const b=document.getElementById('btn');b.innerText='登录中...';b.disabled=true;const res=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`username=${encodeURIComponent(document.getElementById('u').value)}&password=${encodeURIComponent(document.getElementById('p').value)}`});if(res.redirected){location.href=res.url}else if(res.ok){location.href='/'}else{alert('用户名或密码错误');b.innerText='登 录';b.disabled=false}}</script></body></html>
 "#;
 
-// 【修复 2】前端 JS：location.reload -> location.href = '/login'
 const DASHBOARD_HTML: &str = r#"
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"><title>HiaPortFusion Panel</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>:root{--primary:#3b82f6;--danger:#f87171;--success:#34d399;--text-main:#374151}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.1);border-radius:10px}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0;height:100vh;height:100dvh;overflow:hidden;background:url('{{BG_PC}}') no-repeat center center/cover;display:flex;flex-direction:column;color:var(--text-main)}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.navbar{flex:0 0 auto;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);border-bottom:1px solid rgba(255,255,255,0.3);padding:0.8rem 2rem;display:flex;justify-content:space-between;align-items:center;z-index:10}.brand{font-weight:700;font-size:1.1rem;color:var(--text-main);display:flex;align-items:center;gap:10px}.container{flex:1;display:flex;flex-direction:column;max-width:1100px;margin:1.5rem auto;width:95%;overflow:hidden}.card-fixed{background:rgba(255,255,255,0.3);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;padding:1.2rem;margin-bottom:1.5rem;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.card-scroll{flex:1;background:rgba(255,255,255,0.25);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.table-wrapper{flex:1;overflow-y:auto;padding:0 1.5rem 1.5rem}table{width:100%;border-collapse:separate;border-spacing:0 10px}
 thead th{position:sticky;top:0;background:rgba(255,255,255,0.4);backdrop-filter:blur(15px);z-index:5;padding:14px 12px;text-align:left;font-size:0.85rem;text-transform:uppercase;letter-spacing:1px;color:#6b7280;border-top:1px solid rgba(255,255,255,0.3);border-bottom:1px solid rgba(255,255,255,0.3)}
@@ -748,9 +772,8 @@ task_finish
 # =================编译与服务配置=================
 
 # 3. 编译
-task_start "正在编译面板 (此过程需要 3-10 分钟)"
+task_start "正在编译面板 (请耐心等待！)"
 
-# 设置 Cargo 编译环境 (适配国内网络环境建议自行配置镜像，这里使用默认)
 if [[ "$(uname -m)" == "aarch64" ]]; then
     RUST_TRIPLE="aarch64-unknown-linux-gnu"
 else
@@ -783,11 +806,10 @@ else
     exit 1
 fi
 
-# 清理编译文件
+
 cd ~
 rm -rf "$WORK_DIR"
 
-# 创建 systemd 服务
 cat > /etc/systemd/system/hipf-panel.service <<EOF
 [Unit]
 Description=HiaPortFusion Panel (HAProxy+GOST)
@@ -813,12 +835,19 @@ systemctl enable hipf-panel >/dev/null 2>&1
 systemctl restart hipf-panel >/dev/null 2>&1
 task_finish
 
-IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
+RAW_IP=$(curl -s4 ifconfig.me/ip || curl -s6 ifconfig.me/ip || hostname -I | awk '{print $1}')
+if [[ "$RAW_IP" == *:* ]]; then
+    SHOW_IP="[$RAW_IP]"
+else
+    SHOW_IP="$RAW_IP"
+fi
+
 echo -e ""
 echo -e "${GREEN}============================================${RESET}"
 echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功            ${RESET}"
 echo -e "${GREEN}============================================${RESET}"
-echo -e "访问地址 : ${YELLOW}http://${IP}:${PANEL_PORT}${RESET}"
+echo -e "访问地址 : ${YELLOW}http://${SHOW_IP}:${PANEL_PORT}${RESET}"
 echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
 echo -e "默认密码 : ${YELLOW}${DEFAULT_PASS}${RESET}"
 echo -e ""
+echo -e "${GREEN}============================================${RESET}"
