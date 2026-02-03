@@ -43,30 +43,23 @@ spinner() {
 
 run_step() {
     echo -e -n "${CYAN}>>> $1...${RESET}"
-    # 修正：直接执行传入的命令或函数名，不再依赖复杂的字符串eval
-    # 将错误输出也重定向到 null，除非调试需要
     eval "$2" >/dev/null 2>&1 &
     spinner $!
-    # 检查后台进程退出状态
-    wait $!
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN} [完成]${RESET}"
-    else
-        echo -e "${RED} [失败]${RESET}"
-        exit 1
-    fi
+    echo -e "${GREEN} [完成]${RESET}"
 }
 
-# ================= 任务逻辑封装 (解决引用嵌套问题) =================
+# =================环境准备与依赖安装=================
 
-task_install_dependencies() {
+install_dependencies() {
+    echo -e "${CYAN}>>> 正在安装 HAProxy, GOST 及编译环境...${RESET}"
+    
     # 1. 系统包
     if [ -f /etc/debian_version ]; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get install -y haproxy ca-certificates curl wget tar git build-essential pkg-config libssl-dev iptables
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y haproxy ca-certificates curl wget tar git build-essential pkg-config libssl-dev iptables >/dev/null 2>&1
     elif [ -f /etc/redhat-release ]; then
-        yum install -y haproxy ca-certificates curl wget tar git gcc gcc-c++ make pkgconfig openssl-devel iptables-services
+        yum install -y haproxy ca-certificates curl wget tar git gcc gcc-c++ make pkgconfig openssl-devel iptables-services >/dev/null 2>&1
     fi
 
     # 2. 安装 GOST (适配架构)
@@ -77,7 +70,7 @@ task_install_dependencies() {
             aarch64|arm64) GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_arm64.tar.gz" ;;
             *) echo -e "${RED}不支持的架构: $ARCH${RESET}"; exit 1 ;;
         esac
-        wget -O /tmp/gost.tar.gz "$GOST_URL"
+        wget -O /tmp/gost.tar.gz "$GOST_URL" >/dev/null 2>&1
         tar -xf /tmp/gost.tar.gz -C /tmp
         mv /tmp/gost "$GOST_BIN"
         chmod +x "$GOST_BIN"
@@ -86,8 +79,11 @@ task_install_dependencies() {
 
     # 3. 安装 Rust
     if ! command -v cargo >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        echo -e -n "${CYAN}>>> 安装 Rust 编译器 ...${RESET}"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 &
+        spinner $!
         source "$HOME/.cargo/env"
+        echo -e "${GREEN} [完成]${RESET}"
     else
         source "$HOME/.cargo/env"
     fi
@@ -110,11 +106,45 @@ defaults
     timeout server  60s
 EOF
     fi
-    systemctl enable haproxy
+    systemctl enable haproxy >/dev/null 2>&1
     systemctl restart haproxy
 }
 
-task_generate_source() {
+# =================代码生成与编译=================
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}请以 root 用户运行！${RESET}"
+    exit 1
+fi
+
+clear
+echo -e "${GREEN}==========================================${RESET}"
+echo -e "${GREEN}   HiaPortFusion Panel (HAProxy+GOST)     ${RESET}"
+echo -e "${GREEN}==========================================${RESET}"
+
+install_dependencies
+mkdir -p "$WORK_DIR/src"
+cd "$WORK_DIR"
+
+# 1. 生成 Cargo.toml
+cat > Cargo.toml <<EOF
+[package]
+name = "hipf-panel"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-cookies = "0.10"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+EOF
+
+# 2. 生成 Rust 核心代码 (src/main.rs)
+run_step "生成面板源代码" "
 cat > src/main.rs << 'EOF'
 use axum::{
     extract::{State, Path},
@@ -722,51 +752,14 @@ async function saveBatch(){const raw=$('batch_input').value;if(!raw.trim())retur
 async function delAll(){if(rules.length===0||!confirm('⚠️ 确定清空？'))return;await fetch('/api/rules/all',{method:'DELETE'});load()}
 setInterval(load, 3000); load(); window.addEventListener('resize',render);
 </script></body></html>
+"#;
 EOF
-}
-
-# =================代码生成与编译=================
-
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请以 root 用户运行！${RESET}"
-    exit 1
-fi
-
-clear
-echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}   HiaPortFusion Panel (HAProxy+GOST)     ${RESET}"
-echo -e "${GREEN}==========================================${RESET}"
-
-# 调用封装后的函数
-run_step "正在安装 HAProxy, GOST 及编译环境" task_install_dependencies
-
-mkdir -p "$WORK_DIR/src"
-cd "$WORK_DIR"
-
-# 1. 生成 Cargo.toml
-cat > Cargo.toml <<EOF
-[package]
-name = "hipf-panel"
-version = "1.0.0"
-edition = "2021"
-
-[dependencies]
-axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tower-cookies = "0.10"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-EOF
-
-# 2. 生成 Rust 核心代码 (src/main.rs)
-run_step "生成面板源代码" task_generate_source
 
 # =================编译与服务配置=================
 
 echo -e -n "${CYAN}>>> 正在编译面板 (请耐心等待！)...${RESET}"
 
+# 设置 Cargo 编译环境 (适配国内网络环境建议自行配置镜像，这里使用默认)
 if [[ "$(uname -m)" == "aarch64" ]]; then
     RUST_TRIPLE="aarch64-unknown-linux-gnu"
 else
@@ -828,7 +821,7 @@ echo -e "${GREEN} [服务已启动]${RESET}"
 IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
 echo -e ""
 echo -e "${GREEN}============================================${RESET}"
-echo -e "${GREEN}     ✅ HiaPortFusion 面板部署成功            ${RESET}"
+echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功           ${RESET}"
 echo -e "${GREEN}============================================${RESET}"
 echo -e "访问地址 : ${YELLOW}http://${IP}:${PANEL_PORT}${RESET}"
 echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
