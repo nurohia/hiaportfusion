@@ -28,9 +28,16 @@ echo -e "${GREEN}==========================================${RESET}"
 echo -e "${GREEN}    HiaPortFusion 面板  ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
+# 必须 root
+if [ "$EUID" -ne 0 ]; then
+  echo -e "${RED}[错误] 请以 root 用户运行${RESET}"
+  exit 1
+fi
+
+# 保留历史账号/端口
 if [ -f "$DATA_FILE" ] && [ -f "$SERVICE_FILE" ]; then
     echo -e "${CYAN}>>> 检测到历史安装信息...${RESET}"
-    
+
     OLD_USER=$(grep '"username":' "$DATA_FILE" 2>/dev/null | awk -F'"' '{print $4}')
     OLD_PASS=$(grep '"pass_hash":' "$DATA_FILE" 2>/dev/null | awk -F'"' '{print $4}')
     OLD_PORT=$(grep "PANEL_PORT=" "$SERVICE_FILE" 2>/dev/null | sed 's/.*PANEL_PORT=\([0-9]*\).*/\1/')
@@ -70,8 +77,7 @@ fi
 # 3. 依赖检测与安装
 check_and_install_deps() {
     local NEED_UPDATE=0
-    
-    # 基础工具检测
+
     for cmd in haproxy curl wget tar gzip iptables; do
         if ! command -v $cmd >/dev/null 2>&1; then
             NEED_UPDATE=1
@@ -83,9 +89,9 @@ check_and_install_deps() {
         echo -e "${CYAN}>>> 正在安装系统依赖...${RESET}"
         if [ -f /etc/debian_version ]; then
             apt-get update -y >/dev/null 2>&1
-            apt-get install -y haproxy curl wget tar gzip iptables >/dev/null 2>&1
+            apt-get install -y haproxy curl wget tar gzip iptables ca-certificates >/dev/null 2>&1
         elif [ -f /etc/redhat-release ]; then
-            yum install -y haproxy curl wget tar gzip iptables-services >/dev/null 2>&1
+            yum install -y haproxy curl wget tar gzip iptables-services ca-certificates >/dev/null 2>&1
         fi
     fi
 
@@ -93,12 +99,13 @@ check_and_install_deps() {
         echo -e "${YELLOW}>>> 正在安装 GOST...${RESET}"
         local G_URL=""
         case $ARCH in
-            x86_64) G_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz" ;;
+            x86_64)  G_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz" ;;
             aarch64) G_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_arm64.tar.gz" ;;
         esac
-        
-        wget -O /tmp/gost.tar.gz "$G_URL" >/dev/null 2>&1
-        tar -xf /tmp/gost.tar.gz -C /tmp
+
+        rm -f /tmp/gost.tar.gz
+        curl -fL --retry 3 --retry-delay 1 -o /tmp/gost.tar.gz "$G_URL" >/dev/null 2>&1
+        tar -xzf /tmp/gost.tar.gz -C /tmp
         mv /tmp/gost "$GOST_BIN"
         chmod +x "$GOST_BIN"
         rm -f /tmp/gost.tar.gz
@@ -112,11 +119,10 @@ check_and_install_deps() {
         echo -e "${RED}>>> [错误] GOST 安装失败${RESET}"
         exit 1
     fi
-    
-    # 初始化目录
+
     mkdir -p /etc/hipf
     mkdir -p /etc/haproxy
-    
+
     if [ ! -f "/etc/haproxy/haproxy.cfg" ] || [ ! -s "/etc/haproxy/haproxy.cfg" ]; then
         cat > "/etc/haproxy/haproxy.cfg" <<EOF
 global
@@ -129,16 +135,20 @@ defaults
     timeout server  60s
 EOF
     fi
+
+    systemctl enable haproxy >/dev/null 2>&1 || true
+    systemctl restart haproxy >/dev/null 2>&1 || true
 }
 
 check_and_install_deps
 
 # 4. 下载面板
-echo -n ">>> 正在下载面板程序..."
-systemctl stop hipf-panel >/dev/null 2>&1
+echo -e "${CYAN}>>> 正在下载面板程序...${RESET}"
+systemctl stop hipf-panel >/dev/null 2>&1 || true
 rm -f /tmp/hipf-panel.tar.gz
 
-curl -L "$DOWNLOAD_URL" -o /tmp/hipf-panel.tar.gz >/dev/null 2>&1
+# 关键：加 -f + 重试，失败直接退出
+curl -fL --retry 3 --retry-delay 1 -o /tmp/hipf-panel.tar.gz "$DOWNLOAD_URL"
 
 # 文件完整性校验
 FILE_SIZE=$(stat -c%s "/tmp/hipf-panel.tar.gz" 2>/dev/null || echo 0)
@@ -149,19 +159,23 @@ if [ "$FILE_SIZE" -lt 100000 ]; then
     exit 1
 fi
 
+rm -rf /tmp/hipf_unpkg
+mkdir -p /tmp/hipf_unpkg
+tar -xzf /tmp/hipf-panel.tar.gz -C /tmp/hipf_unpkg >/dev/null 2>&1
 
-tar -xzf /tmp/hipf-panel.tar.gz -C /usr/local/bin/ >/dev/null 2>&1
-
-if [ ! -f "/usr/local/bin/hipf-panel" ]; then
-  echo -e "${RED}[错误] 解压后未找到 /usr/local/bin/hipf-panel${RESET}"
+if [ ! -f "/tmp/hipf_unpkg/hipf-panel" ]; then
+  echo -e "${RED}[错误] 解压后未找到 /tmp/hipf_unpkg/hipf-panel${RESET}"
+  echo -e "${YELLOW}当前解压内容：${RESET}"
+  ls -lah /tmp/hipf_unpkg || true
   exit 1
 fi
 
-mv -f /usr/local/bin/hipf-panel "$BINARY_PATH"
-chmod +x "$BINARY_PATH"
+install -m 755 /tmp/hipf_unpkg/hipf-panel "$BINARY_PATH"
+
+rm -rf /tmp/hipf_unpkg
 rm -f /tmp/hipf-panel.tar.gz
 
-echo -e "${GREEN} [完成]${RESET}"
+echo -e "${GREEN}>>> 面板安装完成: $BINARY_PATH${RESET}"
 
 # 5. 配置 Systemd
 cat > "$SERVICE_FILE" <<EOF
@@ -184,10 +198,9 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable hipf-panel >/dev/null 2>&1
-systemctl restart hipf-panel >/dev/null 2>&1
-
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable hipf-panel >/dev/null 2>&1 || true
+systemctl restart hipf-panel >/dev/null 2>&1 || true
 
 RAW_IP=$(curl -s4 ifconfig.me/ip || curl -s6 ifconfig.me/ip || hostname -I | awk '{print $1}')
 if [[ "$RAW_IP" == *:* ]]; then
@@ -198,7 +211,7 @@ fi
 
 echo -e ""
 echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功             ${RESET}"
+echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功        ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 echo -e "访问地址 : ${YELLOW}http://${SHOW_IP}:${PANEL_PORT}${RESET}"
 echo -e "当前用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
