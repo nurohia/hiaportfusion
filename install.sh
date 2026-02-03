@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # ================= 配置区域 =================
-# 核心系统路径 (适配 HiaPortFusion v1.0.8+)
 SERVICE_NAME="hipf-panel"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PANEL_BIN="/usr/local/bin/hipf-panel"
@@ -23,7 +22,6 @@ check_root() {
     fi
 }
 
-# 2. 获取服务器 IP (智能识别 IPv6 加括号)
 get_ip() {
     local IP=$(curl -s4 ifconfig.me/ip || curl -s6 ifconfig.me/ip || hostname -I | awk '{print $1}')
     if [[ "$IP" == *:* ]]; then echo "[$IP]"; else echo "$IP"; fi
@@ -31,7 +29,6 @@ get_ip() {
 
 # ================= 核心功能逻辑 =================
 
-# 3. 修改面板端口 (带安全校验)
 update_panel_port() {
     if [ ! -f "$SERVICE_FILE" ]; then
         echo -e "${RED}错误：检测到面板尚未安装，请先执行安装！${RESET}"
@@ -39,7 +36,6 @@ update_panel_port() {
         return
     fi
 
-    # 提取当前端口
     local CURRENT_PORT=$(grep "PANEL_PORT=" "$SERVICE_FILE" | cut -d'=' -f2 | tr -d '"')
     
     echo -e "--------------------"
@@ -127,9 +123,9 @@ manage_panel() {
     fi
     
     echo -e "------------------------------------------"
-    echo -e "1. 安装面板 (Install)"
-    echo -e "2. 卸载面板 (Uninstall)"
-    echo -e "3. 修改端口 (Change Port)"
+    echo -e "1. 安装面板"
+    echo -e "2. 卸载面板"
+    echo -e "3. 修改端口"
     echo -e "------------------------------------------"
     echo -e "4. 查看状态"
     echo -e "5. 查看日志"
@@ -146,18 +142,16 @@ manage_panel() {
         1)
             clear
             echo -e "${CYAN}--- 安装向导 ---${RESET}"
-            echo -e "1. 快速安装部署 (下载 v1.0.8+ 二进制，推荐)"
-            echo -e "2. 自编译部署 (从源码编译，耗时较长)"
+            echo -e "1. 快速安装部署"
+            echo -e "2. 自编译部署"
             echo -e "0. 返回上级"
             read -p "请选择: " INST_OPT
             case "$INST_OPT" in
                 1) 
-                    # 直接使用 nurohia 仓库的 quickpan.sh
                     bash <(curl -fsSL https://raw.githubusercontent.com/nurohia/hiaportfusion/main/quickpan.sh) 
                     read -p "按回车键继续..." 
                     ;;
                 2) 
-                    # 直接使用 nurohia 仓库的 panel.sh
                     bash <(curl -fsSL https://raw.githubusercontent.com/nurohia/hiaportfusion/main/panel.sh) 
                     read -p "按回车键继续..." 
                     ;;
@@ -165,7 +159,6 @@ manage_panel() {
             esac
             ;;
         2)
-            # 直接使用 nurohia 仓库的 uninstall.sh
             bash <(curl -fsSL https://raw.githubusercontent.com/nurohia/hiaportfusion/main/uninstall.sh)
             read -p "按回车键继续..."
             ;;
