@@ -1,229 +1,129 @@
 #!/bin/bash
-set -euo pipefail
 
-# =================配置区域=================
-URL_AMD="https://github.com/nurohia/hiaportfusion/releases/download/hipf-panel/hipf-panel-amd.tar.gz"
-URL_ARM="https://github.com/nurohia/hiaportfusion/releases/download/hipf-panel/hipf-panel-arm.tar.gz"
-
-# 默认配置（若检测到历史安装会自动保留）
-PANEL_PORT="4796"
-DEFAULT_USER="admin"
-DEFAULT_PASS="123456"
-
+# ================= 配置区域 =================
 # 核心路径
-BINARY_PATH="/usr/local/bin/hipf-panel"
-SERVICE_FILE="/etc/systemd/system/hipf-panel.service"
-DATA_FILE="/etc/hipf/panel_data.json"
-
+PANEL_BIN="/usr/local/bin/hipf-panel"
 GOST_BIN="/usr/local/bin/gost"
-# 必须与 Rust 代码里的常量一致（v1.0.7+）
 GOST_PRO_BIN="/usr/local/bin/hipf-gost-udp"
+GOST_OLD_BIN="/usr/local/bin/hipf-gost-server"
+GOST_WRAPPER="/usr/local/bin/hipf-gost-udp"
 
-# 颜色
-GREEN="\033[32m"
+DATA_DIR="/etc/hipf"
+HAPROXY_DIR="/etc/haproxy"
+SERVICE_FILE="/etc/systemd/system/hipf-panel.service"
+
+# 颜色定义
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-log()  { echo -e "${CYAN}>>> $*${RESET}"; }
-ok()   { echo -e "${GREEN}✔ $*${RESET}"; }
-warn() { echo -e "${YELLOW}! $*${RESET}"; }
-die()  { echo -e "${RED}✘ $*${RESET}"; exit 1; }
+# ================= 辅助函数 =================
+info() { echo -e "${CYAN}>>> $1${RESET}"; }
+success() { echo -e "${GREEN}✔ $1${RESET}"; }
 
-need_root() {
-  [ "${EUID:-0}" -eq 0 ] || die "请以 root 用户运行！"
-}
+# ================= 主逻辑 =================
 
-# systemctl 有些环境/首次安装会返回非0，别让 set -e 直接退出
-sc() {
-  systemctl "$@" >/dev/null 2>&1 || true
-}
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}错误：请以 root 用户运行！${RESET}"
+    exit 1
+fi
 
-detect_arch_and_url() {
-  local arch
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) echo "$URL_AMD" ;;
-    aarch64|arm64) echo "$URL_ARM" ;;
-    *) die "不支持的系统架构: $arch" ;;
-  esac
-}
+clear
+echo -e "${RED}========================================${RESET}"
+echo -e "${RED}       HiaPortFusion 彻底卸载程序       ${RESET}"
+echo -e "${RED}========================================${RESET}"
+echo ""
+read -p "确认卸载吗？(y/n): " confirm
+if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "操作已取消。"
+    exit 0
+fi
 
-restore_old_config_if_any() {
-  if [ -f "$DATA_FILE" ] && [ -f "$SERVICE_FILE" ]; then
-    log "检测到历史安装信息，尝试保留账号/端口"
+# 1. 停止并禁用服务
+info "正在停止服务和进程..."
 
-    local old_user old_pass old_port
-    old_user="$(grep '"username":' "$DATA_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)"
-    old_pass="$(grep '"pass_hash":' "$DATA_FILE" 2>/dev/null | awk -F'"' '{print $4}' || true)"
-    old_port="$(grep "PANEL_PORT=" "$SERVICE_FILE" 2>/dev/null | sed 's/.*PANEL_PORT=\([0-9]*\).*/\1/' || true)"
+systemctl stop hipf-panel >/dev/null 2>&1 || true
+systemctl disable hipf-panel >/dev/null 2>&1 || true
+systemctl stop haproxy >/dev/null 2>&1 || true
 
-    if [ -n "${old_user:-}" ] && [ -n "${old_pass:-}" ]; then
-      DEFAULT_USER="$old_user"
-      DEFAULT_PASS="$old_pass"
-      ok "已保留账号: $DEFAULT_USER"
+pkill -f "$GOST_BIN" >/dev/null 2>&1 || true
+pkill -x "hipf-gost-udp" >/dev/null 2>&1 || true
+pkill -x "hipf-gost-server" >/dev/null 2>&1 || true
+pkill -f "hipf-gost-udp" >/dev/null 2>&1 || true
+
+success "服务已停止"
+
+# 2. 清理 iptables 规则 (修复报错问题)
+info "正在清理 iptables 防火墙规则..."
+iptables -D INPUT -j HIPF_IN >/dev/null 2>&1 || true
+iptables -D FORWARD -j HIPF_IN >/dev/null 2>&1 || true
+iptables -D OUTPUT -j HIPF_OUT >/dev/null 2>&1 || true
+iptables -D FORWARD -j HIPF_OUT >/dev/null 2>&1 || true
+
+iptables -F HIPF_IN >/dev/null 2>&1 || true
+iptables -X HIPF_IN >/dev/null 2>&1 || true
+iptables -F HIPF_OUT >/dev/null 2>&1 || true
+iptables -X HIPF_OUT >/dev/null 2>&1 || true
+
+
+if command -v iptables-save >/dev/null 2>&1; then
+    if [ -d "/etc/iptables" ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    elif [ -d "/etc/sysconfig" ]; then
+        iptables-save > /etc/sysconfig/iptables 2>/dev/null
     fi
-    if [ -n "${old_port:-}" ]; then
-      PANEL_PORT="$old_port"
-      ok "已保留端口: $PANEL_PORT"
+fi
+success "防火墙规则已清洗"
+
+# 3. 删除文件 (包含 GOST)
+info "正在删除文件残留 (含 GOST)..."
+rm -f "$PANEL_BIN"
+rm -f "$GOST_BIN"       
+rm -f "$GOST_PRO_BIN"    
+rm -f "$GOST_OLD_BIN"  
+rm -f "$SERVICE_FILE"
+rm -rf "$DATA_DIR"
+rm -rf "/opt/hipf_panel"
+rm -rf "/opt/hipf_build"
+systemctl daemon-reload
+success "面板及 GOST 文件已删除"
+
+# 4. 交互式删除依赖
+echo ""
+echo -e "${YELLOW}是否卸载 HAProxy？${RESET}"
+read -p "输入 y 卸载，其他键保留 [y/n]: " rm_hap
+if [[ "$rm_hap" == "y" || "$rm_hap" == "Y" ]]; then
+    info "正在卸载 HAProxy..."
+    if [ -f /etc/debian_version ]; then
+        apt-get purge -y haproxy >/dev/null 2>&1 || true
+    elif [ -f /etc/redhat-release ]; then
+        yum remove -y haproxy >/dev/null 2>&1 || true
     fi
-  fi
-}
+    rm -rf "$HAPROXY_DIR"
+    success "HAProxy 已卸载"
+else
+    echo "已保留 HAProxy"
+fi
 
-install_deps() {
-  log "检查并安装依赖 (haproxy/curl/wget/tar/gzip/iptables)"
+echo ""
+echo -e "${YELLOW}是否卸载 Rust 编译环境？${RESET}"
+echo -e "${CYAN}(如果您服务器上还有其他 Rust 项目，请选择 n)${RESET}"
+read -p "输入 y 卸载，其他键保留 [y/n]: " rm_rust
+if [[ "$rm_rust" == "y" || "$rm_rust" == "Y" ]]; then
+    if command -v rustup >/dev/null 2>&1; then
+        info "正在移除 Rust 环境..."
+        rustup self uninstall -y >/dev/null 2>&1
+        success "Rust 已移除"
+    else
+        echo "未检测到 Rustup，跳过。"
+    fi
+else
+    echo "已保留 Rust 环境"
+fi
 
-  local has_debian=0 has_redhat=0
-  [ -f /etc/debian_version ] && has_debian=1
-  [ -f /etc/redhat-release ] && has_redhat=1
-
-  if [ $has_debian -eq 1 ]; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y haproxy curl wget tar gzip iptables ca-certificates >/dev/null 2>&1 || true
-  elif [ $has_redhat -eq 1 ]; then
-    yum install -y haproxy curl wget tar gzip iptables-services ca-certificates >/dev/null 2>&1 || true
-  else
-    warn "未识别系统包管理器（非 Debian/RedHat），请确保已安装: haproxy curl wget tar gzip iptables"
-  fi
-
-  mkdir -p /etc/hipf /etc/haproxy
-
-  if [ ! -f "/etc/haproxy/haproxy.cfg" ] || [ ! -s "/etc/haproxy/haproxy.cfg" ]; then
-    cat > "/etc/haproxy/haproxy.cfg" <<'EOF'
-global
-    daemon
-    maxconn 10240
-defaults
-    mode tcp
-    timeout connect 5s
-    timeout client  60s
-    timeout server  60s
-EOF
-  fi
-
-  sc enable haproxy
-  sc restart haproxy
-
-  ok "依赖检查完成"
-}
-
-install_gost_and_copy() {
-  if [ ! -f "$GOST_BIN" ]; then
-    log "安装 GOST v3.0.0"
-    local arch g_url
-    arch="$(uname -m)"
-    case "$arch" in
-      x86_64|amd64) g_url="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz" ;;
-      aarch64|arm64) g_url="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_arm64.tar.gz" ;;
-      *) die "不支持的架构（无法安装 GOST）: $arch" ;;
-    esac
-
-    rm -f /tmp/gost.tar.gz
-    curl -fL --retry 3 --retry-delay 1 -o /tmp/gost.tar.gz "$g_url" || die "GOST 下载失败"
-    tar -xzf /tmp/gost.tar.gz -C /tmp || die "GOST 解压失败"
-    [ -f /tmp/gost ] || die "GOST 解压后未找到 /tmp/gost"
-    install -m 755 /tmp/gost "$GOST_BIN"
-    rm -f /tmp/gost.tar.gz /tmp/gost
-  fi
-
-  cp -f "$GOST_BIN" "$GOST_PRO_BIN"
-  chmod +x "$GOST_PRO_BIN"
-  ok "GOST 及专用副本已就绪: $GOST_PRO_BIN"
-}
-
-download_and_install_panel() {
-  local download_url="$1"
-
-  log "下载面板程序"
-  sc stop hipf-panel
-  rm -f /tmp/hipf-panel.tar.gz
-
-  # 不要吞输出，方便看到进度/失败原因
-  curl -fL --retry 3 --retry-delay 1 -o /tmp/hipf-panel.tar.gz "$download_url" || die "面板下载失败"
-
-  local file_size
-  file_size="$(stat -c%s "/tmp/hipf-panel.tar.gz" 2>/dev/null || echo 0)"
-  [ "$file_size" -ge 100000 ] || die "文件过小，疑似下载失败 (Size: ${file_size} bytes)"
-
-  log "解压并安装面板"
-  # tar 包里只有 hipf-panel
-  tar -xzf /tmp/hipf-panel.tar.gz -C /usr/local/bin/ || die "解压失败"
-  [ -f /usr/local/bin/hipf-panel ] || die "解压后未找到 /usr/local/bin/hipf-panel"
-
-  install -m 755 /usr/local/bin/hipf-panel "$BINARY_PATH"
-  rm -f /usr/local/bin/hipf-panel /tmp/hipf-panel.tar.gz
-
-  ok "面板二进制安装完成: $BINARY_PATH"
-}
-
-write_systemd_service() {
-  log "写入 systemd 服务"
-  cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=HiaPortFusion Panel (HAProxy+GOST)
-After=network.target haproxy.service
-
-[Service]
-User=root
-Environment="PANEL_USER=$DEFAULT_USER"
-Environment="PANEL_PASS=$DEFAULT_PASS"
-Environment="PANEL_PORT=$PANEL_PORT"
-LimitNOFILE=1048576
-LimitNPROC=1048576
-ExecStart=$BINARY_PATH
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload || true
-  sc enable hipf-panel
-  sc restart hipf-panel
-  ok "systemd 服务已配置并启动"
-}
-
-show_access_info() {
-  local raw_ip show_ip
-  raw_ip="$(curl -s4 ifconfig.me/ip || curl -s6 ifconfig.me/ip || hostname -I | awk '{print $1}')"
-  if [[ "$raw_ip" == *:* ]]; then
-    show_ip="[$raw_ip]"
-  else
-    show_ip="$raw_ip"
-  fi
-
-  echo -e ""
-  echo -e "${GREEN}==========================================${RESET}"
-  echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功        ${RESET}"
-  echo -e "${GREEN}==========================================${RESET}"
-  echo -e "访问地址 : ${YELLOW}http://${show_ip}:${PANEL_PORT}${RESET}"
-  echo -e "当前用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
-  echo -e "当前密码 : ${YELLOW}${DEFAULT_PASS}${RESET}"
-  echo -e "${GREEN}==========================================${RESET}"
-}
-
-# =================主逻辑=================
-need_root
-
-echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}    HiaPortFusion 面板 (Binary Release)   ${RESET}"
-echo -e "${GREEN}==========================================${RESET}"
-
-restore_old_config_if_any
-
-DOWNLOAD_URL="$(detect_arch_and_url)"
-log "下载链接: $DOWNLOAD_URL"
-
-install_deps
-install_gost_and_copy
-download_and_install_panel "$DOWNLOAD_URL"
-write_systemd_service
-
-# 给你一个明确的状态输出（别再“静默”）
-echo
-systemctl --no-pager --full status hipf-panel || true
-
-show_access_info
+echo ""
+echo -e "${GREEN}========================================${RESET}"
+echo -e "${GREEN}      HiaPortFusion 已彻底卸载          ${RESET}"
+echo -e "${GREEN}========================================${RESET}"
