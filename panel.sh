@@ -62,7 +62,14 @@ install_dependencies() {
         yum install -y haproxy ca-certificates curl wget tar git gcc gcc-c++ make pkgconfig openssl-devel iptables-services >/dev/null 2>&1
     fi
 
-    # 2. 安装 GOST (适配架构)
+    # 2. 确保 HAProxy 运行环境健全 (关键修复)
+    id -u haproxy &>/dev/null || useradd -M -s /sbin/nologin haproxy
+    mkdir -p /run/haproxy
+    chown -R haproxy:haproxy /run/haproxy
+    mkdir -p /var/lib/haproxy
+    chown -R haproxy:haproxy /var/lib/haproxy
+
+    # 3. 安装 GOST (适配架构)
     if [ ! -f "$GOST_BIN" ]; then
         ARCH=$(uname -m)
         case $ARCH in
@@ -77,7 +84,7 @@ install_dependencies() {
         rm -f /tmp/gost.tar.gz
     fi
 
-    # 3. 安装 Rust
+    # 4. 安装 Rust
     if ! command -v cargo >/dev/null 2>&1; then
         echo -e -n "${CYAN}>>> 安装 Rust 编译器 ...${RESET}"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 &
@@ -88,17 +95,21 @@ install_dependencies() {
         source "$HOME/.cargo/env"
     fi
 
-    # 4. 初始化目录
+    # 5. 初始化目录
     mkdir -p /etc/hipf
     mkdir -p "$(dirname $HAPROXY_CFG)"
     
-    # 确保 HAProxy 初始配置存在
+    # 确保 HAProxy 初始配置存在且合规
     if [ ! -f "$HAPROXY_CFG" ] || [ ! -s "$HAPROXY_CFG" ]; then
         cat > "$HAPROXY_CFG" <<EOF
 global
+    log /dev/log local0
+    log 127.0.0.1 local0
+    user haproxy
+    group haproxy
     daemon
-    maxconn 10240
-    log 127.0.0.1 local0 info
+    pidfile /run/haproxy.pid
+    stats socket /run/haproxy.sock mode 660 level admin expose-fd listeners
 defaults
     mode tcp
     timeout connect 5s
@@ -168,7 +179,7 @@ const CHAIN_OUT: &str = "HIPF_OUT";
 struct Rule {
     id: String,
     name: String,
-    listen: String, // format: "port" or "ip:port", but UI sends "port" or "ip:port"
+    listen: String,
     remote: String,
     enabled: bool,
     #[serde(default)]
@@ -266,16 +277,27 @@ async fn main() {
 
 // --- 后端核心逻辑：HAProxy + GOST ---
 fn apply_backend_config(rules: &Vec<Rule>) {
-    // 1. 生成 HAProxy 配置 (TCP)
+    // 1. 生成 HAProxy 配置 (TCP) - 修正版
     let header = r#"global
+    log /dev/log local0
+    log 127.0.0.1 local0
+    user haproxy
+    group haproxy
     daemon
+    pidfile /run/haproxy.pid
+    stats socket /run/haproxy.sock mode 660 level admin expose-fd listeners
     maxconn 10240
-    log 127.0.0.1 local0 info
+
 defaults
+    log global
     mode tcp
+    option tcplog
+    option dontlognull
     timeout connect 5s
     timeout client  60s
     timeout server  60s
+    timeout http-keep-alive 10s
+    timeout check   10s
 
 "#;
     let mut config_content = String::from(header);
@@ -286,8 +308,6 @@ defaults
             if port.is_empty() { continue; }
             
             // 处理 listen 地址，如果有IP则绑定IP，否则0.0.0.0
-            let bind_addr = if rule.listen.contains(':') { &rule.listen } else { &format!("0.0.0.0:{}", port) }; // Hacky but works for simplified UI input
-            // UI如果是纯端口，手动修正
             let actual_bind = if rule.listen.contains(':') { rule.listen.clone() } else { format!("0.0.0.0:{}", rule.listen) };
 
             config_content.push_str(&format!("listen hipf-{}\n", rule.id));
@@ -297,6 +317,7 @@ defaults
     }
     
     let _ = fs::write(HAPROXY_CFG, config_content);
+    // 重载 haproxy
     let _ = Command::new("systemctl").arg("reload").arg("haproxy").status();
 
     // 2. 管理 GOST 进程 (UDP)
@@ -334,7 +355,7 @@ fn init_firewall_chains() {
     let _ = Command::new("iptables").args(["-N", CHAIN_IN]).status();
     let _ = Command::new("iptables").args(["-N", CHAIN_OUT]).status();
     // 确保 INPUT/OUTPUT/FORWARD 链跳转到我们的自定义链
-    for chain in ["INPUT", "FORWARD"] { // GOST/HAProxy 本机处理主要靠 INPUT
+    for chain in ["INPUT", "FORWARD"] {
         let check = Command::new("iptables").args(["-C", chain, "-j", CHAIN_IN]).status();
         if check.is_err() || !check.unwrap().success() {
             let _ = Command::new("iptables").args(["-I", chain, "-j", CHAIN_IN]).status();
@@ -366,9 +387,6 @@ fn add_iptables_rule(rule: &Rule) {
         // IN: 匹配目标端口
         let _ = Command::new("iptables").args(["-A", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
         // OUT: 匹配源端口 (回包)
-        // 使用 conntrack 确保匹配的是响应包
-        // 简化版：直接匹配 sport 也可以，但 conntrack 更准。这里为了兼容性，使用简单 sport 统计
-        // 修正：对于服务器来说，出站流量源端口是监听端口
         let _ = Command::new("iptables").args(["-A", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
     }
 }
@@ -617,7 +635,6 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
         if !port.is_empty() { last_map.remove(&port); }
         if rule.enabled { remove_iptables_rule(rule); add_iptables_rule(rule); }
         save_json(&data);
-        // 这里不需要重启后端，只是重置计数
     }
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
@@ -761,7 +778,6 @@ EOF
 
 echo -e -n "${CYAN}>>> 正在编译面板 (请耐心等待！)...${RESET}"
 
-# 设置 Cargo 编译环境 (适配国内网络环境建议自行配置镜像，这里使用默认)
 if [[ "$(uname -m)" == "aarch64" ]]; then
     RUST_TRIPLE="aarch64-unknown-linux-gnu"
 else
@@ -823,7 +839,7 @@ echo -e "${GREEN} [服务已启动]${RESET}"
 IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
 echo -e ""
 echo -e "${GREEN}============================================${RESET}"
-echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功           ${RESET}"
+echo -e "${GREEN}     ✅ HiaPortFusion 面板部署成功            ${RESET}"
 echo -e "${GREEN}============================================${RESET}"
 echo -e "访问地址 : ${YELLOW}http://${IP}:${PANEL_PORT}${RESET}"
 echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
