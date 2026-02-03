@@ -151,12 +151,17 @@ if [ "$FILE_SIZE" -lt 100000 ]; then
 fi
 
 
-tar -xzvf /tmp/hipf-panel.tar.gz -C /usr/local/bin/ >/dev/null 2>&1
-if [ -f "/usr/local/bin/hipf-panel-amd" ]; then mv /usr/local/bin/hipf-panel-amd "$BINARY_PATH"; fi
-if [ -f "/usr/local/bin/hipf-panel-arm" ]; then mv /usr/local/bin/hipf-panel-arm "$BINARY_PATH"; fi
+tar -xzf /tmp/hipf-panel.tar.gz -C /usr/local/bin/ >/dev/null 2>&1
 
+if [ ! -f "/usr/local/bin/hipf-panel" ]; then
+  echo -e "${RED}[错误] 解压后未找到 /usr/local/bin/hipf-panel${RESET}"
+  exit 1
+fi
+
+mv -f /usr/local/bin/hipf-panel "$BINARY_PATH"
 chmod +x "$BINARY_PATH"
 rm -f /tmp/hipf-panel.tar.gz
+
 echo -e "${GREEN} [完成]${RESET}"
 
 # 5. 配置 Systemd
