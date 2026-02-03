@@ -266,7 +266,9 @@ async fn main() {
 
 // --- 后端核心逻辑：HAProxy + GOST ---
 fn apply_backend_config(rules: &Vec<Rule>) {
+    // 1. 生成 HAProxy 配置 (TCP)
     let header = r#"global
+    daemon
     maxconn 10240
     log 127.0.0.1 local0 info
 defaults
