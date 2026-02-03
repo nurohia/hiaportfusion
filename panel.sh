@@ -123,7 +123,6 @@ echo -e "${GREEN}   HiaPortFusion Panel (HAProxy+GOST)     ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
 install_dependencies
-echo -e "${CYAN}>>> 生成代码源码...${RESET}"
 mkdir -p "$WORK_DIR/src"
 cd "$WORK_DIR"
 
@@ -145,7 +144,7 @@ chrono = { version = "0.4", features = ["serde"] }
 EOF
 
 # 2. 生成 Rust 核心代码 (src/main.rs)
-
+run_step "生成面板源代码" "
 cat > src/main.rs << 'EOF'
 use axum::{
     extract::{State, Path},
