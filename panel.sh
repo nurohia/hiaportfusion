@@ -51,7 +51,7 @@ run_step() {
 # =================环境准备与依赖安装=================
 
 install_dependencies() {
-    run_step "正在安装 HAProxy, GOST 及编译环境" "
+    echo -e -n "${CYAN}>>> 正在安装 HAProxy, GOST 及编译环境 ...${RESET}"
     
     # 1. 系统包
     if [ -f /etc/debian_version ]; then
