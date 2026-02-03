@@ -13,18 +13,20 @@ DATA_FILE="/etc/hipf/panel_data.json"
 HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
 GOST_BIN="/usr/local/bin/gost"
 
-# 颜色定义
+# 颜色与图标定义
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
+CHECK_MARK="${GREEN}✔${RESET}"
+CROSS_MARK="${RED}✘${RESET}"
 
 # 流量统计链名称
 CHAIN_IN="HIPF_IN"
 CHAIN_OUT="HIPF_OUT"
 
-# =================基础函数=================
+# =================基础函数库=================
 
 spinner() {
     local pid=$1
@@ -41,17 +43,23 @@ spinner() {
     printf "    \b\b\b\b"
 }
 
-run_step() {
+task_start() {
     echo -e -n "${CYAN}>>> $1...${RESET}"
-    eval "$2" >/dev/null 2>&1 &
-    spinner $!
-    echo -e "${GREEN} [完成]${RESET}"
+}
+
+task_finish() {
+    echo -e " [${CHECK_MARK}] ${GREEN}完成${RESET}"
+}
+
+task_fail() {
+    echo -e " [${CROSS_MARK}] ${RED}失败${RESET}"
+    exit 1
 }
 
 # =================环境准备与依赖安装=================
 
 install_dependencies() {
-    echo -e "${CYAN}>>> 正在安装 HAProxy, GOST 及编译环境...${RESET}"
+    task_start "正在初始化环境与依赖 (HAProxy, GOST, Rust)"
     
     # 1. 系统包
     if [ -f /etc/debian_version ]; then
@@ -62,14 +70,7 @@ install_dependencies() {
         yum install -y haproxy ca-certificates curl wget tar git gcc gcc-c++ make pkgconfig openssl-devel iptables-services >/dev/null 2>&1
     fi
 
-    # 2. 确保 HAProxy 运行环境健全 (关键修复)
-    id -u haproxy &>/dev/null || useradd -M -s /sbin/nologin haproxy
-    mkdir -p /run/haproxy
-    chown -R haproxy:haproxy /run/haproxy
-    mkdir -p /var/lib/haproxy
-    chown -R haproxy:haproxy /var/lib/haproxy
-
-    # 3. 安装 GOST (适配架构)
+    # 2. 安装 GOST (适配架构)
     if [ ! -f "$GOST_BIN" ]; then
         ARCH=$(uname -m)
         case $ARCH in
@@ -84,32 +85,25 @@ install_dependencies() {
         rm -f /tmp/gost.tar.gz
     fi
 
-    # 4. 安装 Rust
+    # 3. 安装 Rust
     if ! command -v cargo >/dev/null 2>&1; then
-        echo -e -n "${CYAN}>>> 安装 Rust 编译器 ...${RESET}"
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1 &
-        spinner $!
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1
         source "$HOME/.cargo/env"
-        echo -e "${GREEN} [完成]${RESET}"
     else
         source "$HOME/.cargo/env"
     fi
 
-    # 5. 初始化目录
+    # 4. 初始化目录
     mkdir -p /etc/hipf
     mkdir -p "$(dirname $HAPROXY_CFG)"
     
-    # 确保 HAProxy 初始配置存在且合规
+    # 确保 HAProxy 初始配置存在
     if [ ! -f "$HAPROXY_CFG" ] || [ ! -s "$HAPROXY_CFG" ]; then
         cat > "$HAPROXY_CFG" <<EOF
 global
-    log /dev/log local0
-    log 127.0.0.1 local0
-    user haproxy
-    group haproxy
     daemon
-    pidfile /run/haproxy.pid
-    stats socket /run/haproxy.sock mode 660 level admin expose-fd listeners
+    maxconn 10240
+    log 127.0.0.1 local0 info
 defaults
     mode tcp
     timeout connect 5s
@@ -119,9 +113,11 @@ EOF
     fi
     systemctl enable haproxy >/dev/null 2>&1
     systemctl restart haproxy
+
+    task_finish
 }
 
-# =================代码生成与编译=================
+# =================主逻辑=================
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}请以 root 用户运行！${RESET}"
@@ -131,17 +127,22 @@ fi
 clear
 echo -e "${GREEN}==========================================${RESET}"
 echo -e "${GREEN}   HiaPortFusion Panel (HAProxy+GOST)     ${RESET}"
+echo -e "${GREEN}   v1.0.3 (细节打磨+完美体验版)             ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
+# 1. 安装依赖
 install_dependencies
+
+# 2. 生成源码
+task_start "正在生成面板核心源码 (Rust Source)"
 mkdir -p "$WORK_DIR/src"
 cd "$WORK_DIR"
 
-# 1. 生成 Cargo.toml
+# 生成 Cargo.toml
 cat > Cargo.toml <<EOF
 [package]
 name = "hipf-panel"
-version = "1.0.0"
+version = "1.0.3"
 edition = "2021"
 
 [dependencies]
@@ -154,8 +155,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 EOF
 
-# 2. 生成 Rust 核心代码 (src/main.rs)
-run_step "生成面板源代码" "
+# 生成 Rust 核心代码 (src/main.rs)
 cat > src/main.rs << 'EOF'
 use axum::{
     extract::{State, Path},
@@ -174,12 +174,13 @@ const HAPROXY_CFG: &str = "/etc/haproxy/haproxy.cfg";
 const GOST_BIN: &str = "/usr/local/bin/gost";
 const CHAIN_IN: &str = "HIPF_IN";
 const CHAIN_OUT: &str = "HIPF_OUT";
+const GOST_TAG: &str = "#HIPF-UDP"; 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Rule {
     id: String,
     name: String,
-    listen: String,
+    listen: String, 
     remote: String,
     enabled: bool,
     #[serde(default)]
@@ -195,7 +196,7 @@ struct Rule {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct AdminConfig {
     username: String,
-    pass_hash: String,
+    pass_hash: String, 
     #[serde(default = "default_bg_pc")]
     bg_pc: String,
     #[serde(default = "default_bg_mobile")]
@@ -219,6 +220,7 @@ struct TrafficStats {
 struct AppState {
     data: Mutex<AppData>,
     last_traffic_map: Mutex<HashMap<String, TrafficStats>>,
+    active_token: Mutex<Option<String>>,
 }
 
 #[tokio::main]
@@ -226,16 +228,14 @@ async fn main() {
     init_firewall_chains();
     
     let initial_data = load_or_init_data();
-    
-    // 初始化应用后端
     apply_backend_config(&initial_data.rules);
 
     let state = Arc::new(AppState {
         data: Mutex::new(initial_data),
         last_traffic_map: Mutex::new(HashMap::new()),
+        active_token: Mutex::new(None),
     });
     
-    // 初始化 iptables 规则
     {
         let data = state.data.lock().unwrap();
         flush_iptables_chains(); 
@@ -275,29 +275,18 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-// --- 后端核心逻辑：HAProxy + GOST ---
-fn apply_backend_config(rules: &Vec<Rule>) {
-    // 1. 生成 HAProxy 配置 (TCP) - 修正版
-    let header = r#"global
-    log /dev/log local0
-    log 127.0.0.1 local0
-    user haproxy
-    group haproxy
-    daemon
-    pidfile /run/haproxy.pid
-    stats socket /run/haproxy.sock mode 660 level admin expose-fd listeners
-    maxconn 10240
+// --- 后端核心逻辑 ---
 
+fn apply_backend_config(rules: &Vec<Rule>) {
+    let header = r#"global
+    daemon
+    maxconn 10240
+    log 127.0.0.1 local0 info
 defaults
-    log global
     mode tcp
-    option tcplog
-    option dontlognull
     timeout connect 5s
     timeout client  60s
     timeout server  60s
-    timeout http-keep-alive 10s
-    timeout check   10s
 
 "#;
     let mut config_content = String::from(header);
@@ -306,10 +295,7 @@ defaults
         if rule.enabled {
             let port = get_port(&rule.listen);
             if port.is_empty() { continue; }
-            
-            // 处理 listen 地址，如果有IP则绑定IP，否则0.0.0.0
             let actual_bind = if rule.listen.contains(':') { rule.listen.clone() } else { format!("0.0.0.0:{}", rule.listen) };
-
             config_content.push_str(&format!("listen hipf-{}\n", rule.id));
             config_content.push_str(&format!("    bind {}\n", actual_bind));
             config_content.push_str(&format!("    server s1 {}\n\n", rule.remote));
@@ -317,44 +303,28 @@ defaults
     }
     
     let _ = fs::write(HAPROXY_CFG, config_content);
-    // 重载 haproxy
     let _ = Command::new("systemctl").arg("reload").arg("haproxy").status();
 
-    // 2. 管理 GOST 进程 (UDP)
-    let _ = Command::new("pkill").arg("-f").arg(format!("{} -L=udp", GOST_BIN)).status();
-    
-    // 等待瞬间释放端口
+    let _ = Command::new("pkill").arg("-f").arg(GOST_TAG).status();
     std::thread::sleep(Duration::from_millis(100));
 
     for rule in rules {
         if rule.enabled {
             let port = get_port(&rule.listen);
             if port.is_empty() { continue; }
-            
-            let listen_ip = if rule.listen.contains(':') { 
-                rule.listen.split(':').next().unwrap_or("0.0.0.0") 
-            } else { "0.0.0.0" };
-
-            // 脚本里用的: -L=udp://LISTEN_ADDR:PORT/TARGET
-            let gost_arg = format!("udp://{}:{}/{}", listen_ip, port, rule.remote);
-            
-            Command::new("nohup")
-                .arg(GOST_BIN)
-                .arg("-L")
-                .arg(gost_arg)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok();
+            let listen_ip = if rule.listen.contains(':') { rule.listen.split(':').next().unwrap_or("0.0.0.0") } else { "0.0.0.0" };
+            let gost_target = format!("udp://{}:{}/{}", listen_ip, port, rule.remote);
+            let cmd_str = format!("exec {} -L {} {}", GOST_BIN, gost_target, GOST_TAG);
+            Command::new("nohup").arg("sh").arg("-c").arg(cmd_str).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok();
         }
     }
 }
 
+// --- iptables 流量统计逻辑 ---
 
 fn init_firewall_chains() {
     let _ = Command::new("iptables").args(["-N", CHAIN_IN]).status();
     let _ = Command::new("iptables").args(["-N", CHAIN_OUT]).status();
-    // 确保 INPUT/OUTPUT/FORWARD 链跳转到我们的自定义链
     for chain in ["INPUT", "FORWARD"] {
         let check = Command::new("iptables").args(["-C", chain, "-j", CHAIN_IN]).status();
         if check.is_err() || !check.unwrap().success() {
@@ -382,12 +352,15 @@ fn add_iptables_rule(rule: &Rule) {
     let port = get_port(&rule.listen);
     if port.is_empty() { return; }
     
-    // 同时监控 TCP 和 UDP
     for proto in ["tcp", "udp"] {
-        // IN: 匹配目标端口
-        let _ = Command::new("iptables").args(["-A", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
-        // OUT: 匹配源端口 (回包)
-        let _ = Command::new("iptables").args(["-A", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
+        let check_in = Command::new("iptables").args(["-C", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
+        if check_in.is_err() || !check_in.unwrap().success() {
+             let _ = Command::new("iptables").args(["-A", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
+        }
+        let check_out = Command::new("iptables").args(["-C", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
+        if check_out.is_err() || !check_out.unwrap().success() {
+            let _ = Command::new("iptables").args(["-A", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
+        }
     }
 }
 
@@ -395,8 +368,14 @@ fn remove_iptables_rule(rule: &Rule) {
     let port = get_port(&rule.listen);
     if port.is_empty() { return; }
     for proto in ["tcp", "udp"] {
-        let _ = Command::new("iptables").args(["-D", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
-        let _ = Command::new("iptables").args(["-D", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
+        loop {
+            let status = Command::new("iptables").args(["-D", CHAIN_IN, "-p", proto, "--dport", &port, "-j", "RETURN"]).status();
+            if status.is_err() || !status.unwrap().success() { break; }
+        }
+        loop {
+            let status = Command::new("iptables").args(["-D", CHAIN_OUT, "-p", proto, "--sport", &port, "-j", "RETURN"]).status();
+            if status.is_err() || !status.unwrap().success() { break; }
+        }
     }
 }
 
@@ -406,7 +385,6 @@ fn fetch_iptables_counters() -> HashMap<String, TrafficStats> {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(_) => return map,
     };
-
     for line in output.lines() {
         if !line.starts_with('[') { continue; }
         let end_bracket = match line.find(']') { Some(i) => i, None => continue };
@@ -414,12 +392,9 @@ fn fetch_iptables_counters() -> HashMap<String, TrafficStats> {
         if parts.len() != 2 { continue; }
         let bytes: u64 = parts[1].parse().unwrap_or(0);
         if bytes == 0 { continue; }
-
         let is_in = line.contains(&format!("-A {}", CHAIN_IN));
         let is_out = line.contains(&format!("-A {}", CHAIN_OUT));
         if !is_in && !is_out { continue; }
-
-        // 解析端口 --dport X or --sport X
         let flag = if is_in { "--dport" } else { "--sport" };
         if let Some(pos) = line.find(flag) {
             let rest = &line[pos + flag.len()..];
@@ -433,28 +408,23 @@ fn fetch_iptables_counters() -> HashMap<String, TrafficStats> {
     map
 }
 
+// --- 数据管理与 Auth ---
 
 fn update_traffic_and_check(state: &Arc<AppState>) {
     let current_counters = fetch_iptables_counters();
     let mut last_map = state.last_traffic_map.lock().unwrap();
     let mut data = state.data.lock().unwrap();
-    
     let now = Utc::now().timestamp_millis() as u64;
     let mut changed = false;
     let mut need_apply = false;
-
     for rule in data.rules.iter_mut() {
         if !rule.enabled { continue; }
         let port = get_port(&rule.listen);
-        
         let curr = *current_counters.get(&port).unwrap_or(&TrafficStats{in_bytes:0, out_bytes:0});
         let last = *last_map.get(&port).unwrap_or(&TrafficStats{in_bytes:0, out_bytes:0});
-        
-        // 简单的增量计算
         let delta_in = if curr.in_bytes >= last.in_bytes { curr.in_bytes - last.in_bytes } else { curr.in_bytes };
         let delta_out = if curr.out_bytes >= last.out_bytes { curr.out_bytes - last.out_bytes } else { curr.out_bytes };
         let usage_inc = cmp::max(delta_in, delta_out);
-
         if usage_inc > 0 {
             rule.traffic_used += usage_inc;
             changed = true;
@@ -462,8 +432,6 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
         } else {
             last_map.insert(port.clone(), curr);
         }
-
-        // 检查过期
         if rule.expire_date > 0 && now > rule.expire_date {
             rule.enabled = false;
             rule.status_msg = "已过期".to_string();
@@ -471,7 +439,6 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
             need_apply = true;
             remove_iptables_rule(rule);
         }
-        // 检查流量超限
         if rule.traffic_limit > 0 && rule.traffic_used >= rule.traffic_limit {
             rule.enabled = false;
             rule.status_msg = "流量耗尽".to_string();
@@ -480,20 +447,13 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
             remove_iptables_rule(rule);
         }
     }
-
-    if changed {
-        save_json(&data);
-    }
-    if need_apply {
-        apply_backend_config(&data.rules);
-    }
+    if changed { save_json(&data); }
+    if need_apply { apply_backend_config(&data.rules); }
 }
 
 fn load_or_init_data() -> AppData {
     if let Ok(content) = fs::read_to_string(DATA_FILE) {
-        if let Ok(data) = serde_json::from_str::<AppData>(&content) {
-            return data;
-        }
+        if let Ok(data) = serde_json::from_str::<AppData>(&content) { return data; }
     }
     let admin = AdminConfig {
         username: std::env::var("PANEL_USER").unwrap_or("admin".to_string()),
@@ -507,21 +467,23 @@ fn load_or_init_data() -> AppData {
 }
 
 fn save_json(data: &AppData) {
-    let json_str = serde_json::to_string_pretty(data).unwrap();
-    let _ = fs::write(DATA_FILE, json_str);
+    let _ = fs::write(DATA_FILE, serde_json::to_string_pretty(data).unwrap());
 }
 
-fn check_auth(cookies: &Cookies, state: &AppData) -> bool {
-    if let Some(cookie) = cookies.get("auth_session") {
-        return cookie.value() == state.admin.pass_hash;
+fn check_auth(cookies: &Cookies, state: &Arc<AppState>) -> bool {
+    let active_token = state.active_token.lock().unwrap();
+    if let Some(token_str) = active_token.as_ref() {
+        if let Some(cookie) = cookies.get("auth_session") {
+            return cookie.value() == token_str;
+        }
     }
     false
 }
 
 // 页面Handlers
 async fn index_page(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    if !check_auth(&cookies, &state) { return axum::response::Redirect::to("/login").into_response(); }
     let data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return axum::response::Redirect::to("/login").into_response(); }
     let html = DASHBOARD_HTML
         .replace("{{USER}}", &data.admin.username)
         .replace("{{BG_PC}}", &data.admin.bg_pc)
@@ -529,9 +491,12 @@ async fn index_page(cookies: Cookies, State(state): State<Arc<AppState>>) -> Res
     Html(html).into_response()
 }
 
+// 【修复 1】恢复读取 state 中的配置，确保登录页背景生效
 async fn login_page(State(state): State<Arc<AppState>>) -> Response {
-    let data = state.data.lock().unwrap();
-    let html = LOGIN_HTML.replace("{{BG_PC}}", &data.admin.bg_pc).replace("{{BG_MOBILE}}", &data.admin.bg_mobile);
+    let data = state.data.lock().unwrap(); 
+    let html = LOGIN_HTML
+        .replace("{{BG_PC}}", &data.admin.bg_pc)
+        .replace("{{BG_MOBILE}}", &data.admin.bg_mobile);
     Html(html).into_response()
 }
 
@@ -539,7 +504,10 @@ async fn login_page(State(state): State<Arc<AppState>>) -> Response {
 async fn login_action(cookies: Cookies, State(state): State<Arc<AppState>>, Form(form): Form<LoginParams>) -> Response {
     let data = state.data.lock().unwrap();
     if form.username == data.admin.username && form.password == data.admin.pass_hash {
-        let mut cookie = Cookie::new("auth_session", data.admin.pass_hash.clone());
+        let new_token = uuid::Uuid::new_v4().to_string();
+        let mut active = state.active_token.lock().unwrap();
+        *active = Some(new_token.clone());
+        let mut cookie = Cookie::new("auth_session", new_token);
         cookie.set_path("/"); cookie.set_http_only(true); cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
         cookies.add(cookie);
         axum::response::Redirect::to("/").into_response()
@@ -547,29 +515,28 @@ async fn login_action(cookies: Cookies, State(state): State<Arc<AppState>>, Form
         StatusCode::UNAUTHORIZED.into_response()
     }
 }
-async fn logout_action(cookies: Cookies) -> Response {
+async fn logout_action(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    let mut active = state.active_token.lock().unwrap();
+    *active = None;
     let mut cookie = Cookie::new("auth_session", "");
     cookie.set_path("/"); cookies.remove(cookie);
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
 async fn get_rules(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     Json(data.clone()).into_response()
 }
 
 #[derive(Deserialize)] struct AddRuleReq { name: String, listen: String, remote: String, expire_date: u64, traffic_limit: u64 }
 async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<AddRuleReq>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
-    
-    // 端口冲突检查
     let new_port = get_port(&req.listen);
     if data.rules.iter().any(|r| get_port(&r.listen) == new_port) {
         return Json(serde_json::json!({"status":"error", "message": "端口已被占用！"})).into_response();
     }
-    
     let rule = Rule { 
         id: uuid::Uuid::new_v4().to_string(), 
         name: req.name, listen: req.listen, remote: req.remote, enabled: true,
@@ -578,13 +545,13 @@ async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req
     add_iptables_rule(&rule);
     data.rules.push(rule);
     save_json(&data);
-    apply_backend_config(&data.rules); // 立即应用到 HAProxy/GOST
+    apply_backend_config(&data.rules); 
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
 async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, Json(reqs): Json<Vec<AddRuleReq>>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut added = false;
     for req in reqs {
         let new_port = get_port(&req.listen);
@@ -604,8 +571,8 @@ async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, J
 }
 
 async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     flush_iptables_chains();
     data.rules.clear();
     save_json(&data);
@@ -614,8 +581,8 @@ async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) 
 }
 
 async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
         rule.enabled = !rule.enabled;
         if rule.enabled { rule.status_msg = String::new(); add_iptables_rule(rule); } else { remove_iptables_rule(rule); }
@@ -626,9 +593,9 @@ async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
 }
 
 async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
     let mut last_map = state.last_traffic_map.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
         rule.traffic_used = 0; rule.status_msg = String::new();
         let port = get_port(&rule.listen);
@@ -640,8 +607,8 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
 }
 
 async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     if let Some(pos) = data.rules.iter().position(|r| r.id == id) {
         remove_iptables_rule(&data.rules[pos]);
         data.rules.remove(pos);
@@ -653,8 +620,8 @@ async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
 
 #[derive(Deserialize)] struct UpdateRuleReq { name: String, listen: String, remote: String, expire_date: u64, traffic_limit: u64 }
 async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<UpdateRuleReq>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     let new_port = get_port(&req.listen);
     if data.rules.iter().any(|r| r.id != id && get_port(&r.listen) == new_port) {
         return Json(serde_json::json!({"status":"error", "message": "端口占用"})).into_response();
@@ -676,27 +643,30 @@ async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
 
 #[derive(Deserialize)] struct AccountUpdate { username: String, password: String }
 async fn update_account(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<AccountUpdate>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     data.admin.username = req.username;
     if !req.password.is_empty() { data.admin.pass_hash = req.password; }
-    let mut cookie = Cookie::new("auth_session", data.admin.pass_hash.clone());
-    cookie.set_path("/"); cookie.set_http_only(true); cookies.add(cookie); save_json(&data);
+    let mut active = state.active_token.lock().unwrap();
+    *active = None;
+    save_json(&data);
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
 #[derive(Deserialize)] struct BgUpdate { bg_pc: String, bg_mobile: String }
 async fn update_bg(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<BgUpdate>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
-    if !check_auth(&cookies, &data) { return StatusCode::UNAUTHORIZED.into_response(); }
     data.admin.bg_pc = req.bg_pc; data.admin.bg_mobile = req.bg_mobile; save_json(&data);
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
+// HTML 模板
 const LOGIN_HTML: &str = r#"
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"><title>HiaPortFusion Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:url('{{BG_PC}}') no-repeat center center/cover;color:#374151}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.05)}.box{position:relative;z-index:2;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,0.4);box-shadow:0 8px 32px rgba(0,0,0,0.05);width:90%;max-width:380px;text-align:center}h2{margin-bottom:2rem;color:#374151;font-weight:600;letter-spacing:1px}input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,0.5);border-radius:12px;outline:none;background:rgba(255,255,255,0.5);transition:0.3s;color:#374151}input:focus{background:rgba(255,255,255,0.9);border-color:#3b82f6}button{width:100%;padding:14px;background:rgba(59,130,246,0.85);color:white;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem;transition:0.3s;backdrop-filter:blur(5px)}button:hover{background:#2563eb;transform:translateY(-1px)}</style></head><body><div class="overlay"></div><div class="box"><h2>HiaPortFusion</h2><form onsubmit="doLogin(event)"><input type="text" id="u" placeholder="Username" required><input type="password" id="p" placeholder="Password" required><button type="submit" id="btn">登 录</button></form></div><script>async function doLogin(e){e.preventDefault();const b=document.getElementById('btn');b.innerText='登录中...';b.disabled=true;const res=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`username=${encodeURIComponent(document.getElementById('u').value)}&password=${encodeURIComponent(document.getElementById('p').value)}`});if(res.redirected){location.href=res.url}else if(res.ok){location.href='/'}else{alert('用户名或密码错误');b.innerText='登 录';b.disabled=false}}</script></body></html>
 "#;
 
+// 【修复 2】前端 JS：location.reload -> location.href = '/login'
 const DASHBOARD_HTML: &str = r#"
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"><title>HiaPortFusion Panel</title><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"><style>:root{--primary:#3b82f6;--danger:#f87171;--success:#34d399;--text-main:#374151}::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.1);border-radius:10px}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:0;height:100vh;height:100dvh;overflow:hidden;background:url('{{BG_PC}}') no-repeat center center/cover;display:flex;flex-direction:column;color:var(--text-main)}@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}')}}.navbar{flex:0 0 auto;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);border-bottom:1px solid rgba(255,255,255,0.3);padding:0.8rem 2rem;display:flex;justify-content:space-between;align-items:center;z-index:10}.brand{font-weight:700;font-size:1.1rem;color:var(--text-main);display:flex;align-items:center;gap:10px}.container{flex:1;display:flex;flex-direction:column;max-width:1100px;margin:1.5rem auto;width:95%;overflow:hidden}.card-fixed{background:rgba(255,255,255,0.3);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;padding:1.2rem;margin-bottom:1.5rem;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.card-scroll{flex:1;background:rgba(255,255,255,0.25);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.4);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.03)}.table-wrapper{flex:1;overflow-y:auto;padding:0 1.5rem 1.5rem}table{width:100%;border-collapse:separate;border-spacing:0 10px}
 thead th{position:sticky;top:0;background:rgba(255,255,255,0.4);backdrop-filter:blur(15px);z-index:5;padding:14px 12px;text-align:left;font-size:0.85rem;text-transform:uppercase;letter-spacing:1px;color:#6b7280;border-top:1px solid rgba(255,255,255,0.3);border-bottom:1px solid rgba(255,255,255,0.3)}
@@ -763,7 +733,7 @@ async function del(id){if(confirm('确定删除此规则吗？'))await fetch(`/a
 function openSettings(){$('setModal').style.display='flex';switchTab(0)}
 function closeModal(){document.querySelectorAll('.modal').forEach(x=>x.style.display='none')}
 function switchTab(idx){document.querySelectorAll('.tab-btn').forEach((b,i)=>b.classList.toggle('active',i===idx));document.querySelectorAll('.tab-content').forEach((c,i)=>c.classList.toggle('active',i===idx))}
-async function saveAccount(){await fetch('/api/admin/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('set_u').value,password:$('set_p').value})});alert('账户已更新，请重新登录');location.reload()}
+async function saveAccount(){await fetch('/api/admin/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('set_u').value,password:$('set_p').value})});alert('账户已更新，请重新登录');location.href='/login'}
 async function saveBg(){await fetch('/api/admin/bg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bg_pc:$('bg_pc').value,bg_mobile:$('bg_mob').value})});location.reload()}
 async function doLogout(){await fetch('/logout',{method:'POST'});location.href='/login'}
 function openBatch(){$('batchModal').style.display='flex';$('batch_input').value='';}
@@ -773,11 +743,14 @@ setInterval(load, 3000); load(); window.addEventListener('resize',render);
 </script></body></html>
 "#;
 EOF
+task_finish
 
 # =================编译与服务配置=================
 
-echo -e -n "${CYAN}>>> 正在编译面板 (请耐心等待！)...${RESET}"
+# 3. 编译
+task_start "正在编译面板 (此过程需要 3-10 分钟)"
 
+# 设置 Cargo 编译环境 (适配国内网络环境建议自行配置镜像，这里使用默认)
 if [[ "$(uname -m)" == "aarch64" ]]; then
     RUST_TRIPLE="aarch64-unknown-linux-gnu"
 else
@@ -791,17 +764,21 @@ cat > .cargo/config.toml <<EOF
 linker = "gcc"
 EOF
 
-# 编译
+# 编译执行
 cargo clean >/dev/null 2>&1
-cargo build --release > /tmp/hipf_build.log 2>&1
-
-if [ $? -eq 0 ] && [ -f "target/release/hipf-panel" ]; then
-    echo -e "${GREEN} [编译成功]${RESET}"
-    echo -e -n "${CYAN}>>> 正在部署服务...${RESET}"
-    mv target/release/hipf-panel "$PANEL_BIN"
+if cargo build --release > /tmp/hipf_build.log 2>&1; then
+    task_finish
+    
+    # 4. 部署服务
+    task_start "正在部署系统服务"
+    if [ -f "target/release/hipf-panel" ]; then
+        mv target/release/hipf-panel "$PANEL_BIN"
+    else
+        task_fail
+    fi
 else
-    echo -e "${RED} [编译失败]${RESET}"
-    echo -e "${RED}=== 错误日志 ===${RESET}"
+    echo -e " [${CROSS_MARK}] ${RED}编译失败${RESET}"
+    echo -e "${RED}=== 错误日志 (最后 20 行) ===${RESET}"
     tail -n 20 /tmp/hipf_build.log
     exit 1
 fi
@@ -834,14 +811,14 @@ EOF
 systemctl daemon-reload
 systemctl enable hipf-panel >/dev/null 2>&1
 systemctl restart hipf-panel >/dev/null 2>&1
-echo -e "${GREEN} [服务已启动]${RESET}"
+task_finish
 
 IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
 echo -e ""
 echo -e "${GREEN}============================================${RESET}"
-echo -e "${GREEN}     ✅ HiaPortFusion 面板部署成功            ${RESET}"
+echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功            ${RESET}"
 echo -e "${GREEN}============================================${RESET}"
 echo -e "访问地址 : ${YELLOW}http://${IP}:${PANEL_PORT}${RESET}"
 echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
 echo -e "默认密码 : ${YELLOW}${DEFAULT_PASS}${RESET}"
-echo -e "${GREEN}============================================${RESET}"
+echo -e ""
