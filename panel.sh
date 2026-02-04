@@ -5,7 +5,7 @@ set -e
 PANEL_PORT="4796"
 DEFAULT_USER="admin"
 DEFAULT_PASS="123456"
- 
+
 # 核心路径
 WORK_DIR="/opt/hipf_panel"
 PANEL_BIN="/usr/local/bin/hipf-panel"
@@ -1017,8 +1017,8 @@ td:last-child{border-right:1px solid rgba(255,255,255,0.3);border-top-right-radi
         <label>UDP 转发进程模式</label>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-radius:12px;background:rgba(0,0,0,0.03);">
             <div style="line-height:1.4">
-                <div style="font-weight:600">一个规则一个进程</div>
-                <div style="font-size:0.85rem;color:#6b7280">开：更稳更隔离（占内存多）<br>关：合并为一个进程（省内存，变更会重启UDP）</div>
+                <div style="font-weight:600">一规则一进程</div>
+                <div style="font-size:0.85rem;color:#6b7280">开：更稳更隔离（占内存多）<br>关：合并为一个进程（省内存）</div>
             </div>
             <input id="udp_mode_sw" type="checkbox" style="width:48px;height:22px" onchange="saveUdpMode()">
         </div>
@@ -1073,7 +1073,7 @@ async function resetTraffic(){if(!curId||!confirm('确定重置已用流量统�
 async function tog(id){await fetch(`/api/rules/${id}/toggle`,{method:'POST'});load()}
 async function del(id){if(confirm('确定删除此规则吗？'))await fetch(`/api/rules/${id}`,{method:'DELETE'});load()}
 function openSettings(){$('setModal').style.display='flex';switchTab(0);if(adminCfg){$('udp_mode_sw').checked=(adminCfg.udp_per_rule!==false)}else{$('udp_mode_sw').checked=true}}
-async function saveUdpMode(){const on=$('udp_mode_sw').checked;if(!confirm(on?'切换为：一个规则一个 UDP 进程？':'切换为：合并为一个 gost 进程？（将重启 UDP 转发）')){$('udp_mode_sw').checked=!on;return}const res=await fetch('/api/admin/udp_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({udp_per_rule:on})});if(!res.ok){alert('切换失败');$('udp_mode_sw').checked=!on;return}if(adminCfg)adminCfg.udp_per_rule=on;alert('已切换（UDP 转发已应用）')}
+async function saveUdpMode(){const on=$('udp_mode_sw').checked;if(!confirm(on?'切换为：一规则一个 UDP 进程？':'切换为：合并为一个 gost 进程？（将重启 UDP 转发）')){$('udp_mode_sw').checked=!on;return}const res=await fetch('/api/admin/udp_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({udp_per_rule:on})});if(!res.ok){alert('切换失败');$('udp_mode_sw').checked=!on;return}if(adminCfg)adminCfg.udp_per_rule=on;alert('已切换（UDP 转发已应用）')}
 function closeModal(){document.querySelectorAll('.modal').forEach(x=>x.style.display='none')}
 function switchTab(idx){document.querySelectorAll('.tab-btn').forEach((b,i)=>b.classList.toggle('active',i===idx));document.querySelectorAll('.tab-content').forEach((c,i)=>c.classList.toggle('active',i===idx))}
 async function saveAccount(){await fetch('/api/admin/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('set_u').value,password:$('set_p').value})});alert('账户已更新，请重新登录');location.href='/login'}
