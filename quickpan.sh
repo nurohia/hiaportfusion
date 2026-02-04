@@ -16,6 +16,7 @@ SERVICE_FILE="/etc/systemd/system/hipf-panel.service"
 DATA_FILE="/etc/hipf/panel_data.json"
 GOST_BIN="/usr/local/bin/gost"
 GOST_PRO_BIN="/usr/local/bin/hipf-gost-udp"
+PID_DIR="/run/hipf-gost"
 
 # 颜色定义
 GREEN="\033[32m"
@@ -147,10 +148,8 @@ echo -e "${CYAN}>>> 正在下载面板程序...${RESET}"
 systemctl stop hipf-panel >/dev/null 2>&1 || true
 rm -f /tmp/hipf-panel.tar.gz
 
-# 关键：加 -f + 重试，失败直接退出
 curl -fL --retry 3 --retry-delay 1 -o /tmp/hipf-panel.tar.gz "$DOWNLOAD_URL"
 
-# 文件完整性校验
 FILE_SIZE=$(stat -c%s "/tmp/hipf-panel.tar.gz" 2>/dev/null || echo 0)
 if [ "$FILE_SIZE" -lt 100000 ]; then
     echo -e "${RED} [失败]${RESET}"
@@ -198,6 +197,13 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# ==========================================
+if [ -d "$PID_DIR" ]; then
+    echo -e "${YELLOW}>>> 清理旧的 PID 状态文件...${RESET}"
+    rm -rf "$PID_DIR"
+fi
+# ==========================================
+
 systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl enable hipf-panel >/dev/null 2>&1 || true
 systemctl restart hipf-panel >/dev/null 2>&1 || true
@@ -211,7 +217,7 @@ fi
 
 echo -e ""
 echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功        ${RESET}"
+echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功         ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 echo -e "访问地址 : ${YELLOW}http://${SHOW_IP}:${PANEL_PORT}${RESET}"
 echo -e "当前用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
