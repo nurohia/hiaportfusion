@@ -6,9 +6,10 @@ PANEL_BIN="/usr/local/bin/hipf-panel"
 GOST_BIN="/usr/local/bin/gost"
 GOST_PRO_BIN="/usr/local/bin/hipf-gost-udp"
 GOST_OLD_BIN="/usr/local/bin/hipf-gost-server"
-GOST_WRAPPER="/usr/local/bin/hipf-gost-udp"
 
 DATA_DIR="/etc/hipf"
+RUN_DIR="/run/hipf-gost" 
+
 HAPROXY_DIR="/etc/haproxy"
 SERVICE_FILE="/etc/systemd/system/hipf-panel.service"
 
@@ -32,7 +33,7 @@ fi
 
 clear
 echo -e "${RED}========================================${RESET}"
-echo -e "${RED}       HiaPortFusion 彻底卸载程序       ${RESET}"
+echo -e "${RED}        HiaPortFusion 彻底卸载程序        ${RESET}"
 echo -e "${RED}========================================${RESET}"
 echo ""
 read -p "确认卸载吗？(y/n): " confirm
@@ -46,16 +47,15 @@ info "正在停止服务和进程..."
 
 systemctl stop hipf-panel >/dev/null 2>&1 || true
 systemctl disable hipf-panel >/dev/null 2>&1 || true
-systemctl stop haproxy >/dev/null 2>&1 || true
+# systemctl stop haproxy >/dev/null 2>&1 || true
 
 pkill -f "$GOST_BIN" >/dev/null 2>&1 || true
-pkill -x "hipf-gost-udp" >/dev/null 2>&1 || true
-pkill -x "hipf-gost-server" >/dev/null 2>&1 || true
 pkill -f "hipf-gost-udp" >/dev/null 2>&1 || true
+pkill -9 -f "hipf-gost-udp" >/dev/null 2>&1 || true
 
 success "服务已停止"
 
-# 2. 清理 iptables 规则 (修复报错问题)
+# 2. 清理 iptables 规则
 info "正在清理 iptables 防火墙规则..."
 iptables -D INPUT -j HIPF_IN >/dev/null 2>&1 || true
 iptables -D FORWARD -j HIPF_IN >/dev/null 2>&1 || true
@@ -67,7 +67,6 @@ iptables -X HIPF_IN >/dev/null 2>&1 || true
 iptables -F HIPF_OUT >/dev/null 2>&1 || true
 iptables -X HIPF_OUT >/dev/null 2>&1 || true
 
-
 if command -v iptables-save >/dev/null 2>&1; then
     if [ -d "/etc/iptables" ]; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null
@@ -77,18 +76,19 @@ if command -v iptables-save >/dev/null 2>&1; then
 fi
 success "防火墙规则已清洗"
 
-# 3. 删除文件 (包含 GOST)
-info "正在删除文件残留 (含 GOST)..."
+# 3. 删除文件
+info "正在删除文件残留..."
 rm -f "$PANEL_BIN"
-rm -f "$GOST_BIN"       
-rm -f "$GOST_PRO_BIN"    
+rm -f "$GOST_BIN"        
+rm -f "$GOST_PRO_BIN"     
 rm -f "$GOST_OLD_BIN"  
 rm -f "$SERVICE_FILE"
 rm -rf "$DATA_DIR"
+rm -rf "$RUN_DIR"  # <--- 新增：清理 PID 目录
 rm -rf "/opt/hipf_panel"
 rm -rf "/opt/hipf_build"
 systemctl daemon-reload
-success "面板及 GOST 文件已删除"
+success "面板及核心文件已删除"
 
 # 4. 交互式删除依赖
 echo ""
