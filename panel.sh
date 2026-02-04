@@ -120,7 +120,7 @@ echo -e "${GREEN}==========================================${RESET}"
 install_dependencies
 
 # 2. 生成源码
-task_start "正在生成面板源码 (Rust)"
+task_start "正在生成面板源码"
 mkdir -p "$WORK_DIR/src"
 cd "$WORK_DIR"
 
