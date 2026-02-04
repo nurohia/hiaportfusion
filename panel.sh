@@ -113,7 +113,7 @@ fi
 
 clear
 echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}   HiaPortFusion Panel (HAProxy+GOST)     ${RESET}"
+echo -e "${GREEN}    HiaPortFusion Panel (HAProxy+GOST)      ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
 # 1. 安装依赖
@@ -569,6 +569,9 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
     let current_counters = fetch_iptables_counters();
     let mut last_map = state.last_traffic_map.lock().unwrap();
     let mut data = state.data.lock().unwrap();
+    
+    let udp_per_rule = data.admin.udp_per_rule;
+    
     let now = Utc::now().timestamp_millis() as u64;
     let mut changed = false;
     let mut need_apply_haproxy = false;
@@ -606,7 +609,7 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
             need_apply_haproxy = true;
             remove_iptables_rule(rule);
             
-            if data.admin.udp_per_rule {
+            if udp_per_rule {
                 udp_stop_rule(&rule.id);
             } else {
                 need_merged_restart = true;
@@ -616,7 +619,7 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
     
     if changed { save_json(&data); }
     if need_apply_haproxy { apply_backend_config(&data.rules); }
-    if need_merged_restart && !data.admin.udp_per_rule {
+    if need_merged_restart && !udp_per_rule {
         udp_merged_restart(&data.rules);
     }
 }
@@ -703,6 +706,8 @@ async fn get_rules(cookies: Cookies, State(state): State<Arc<AppState>>) -> Resp
 async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<AddRuleReq>) -> Response {
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
+    let udp_per_rule = data.admin.udp_per_rule;
+    
     let new_port = get_port(&req.listen);
     if data.rules.iter().any(|r| get_port(&r.listen) == new_port) {
         return Json(serde_json::json!({"status":"error", "message": "端口已被占用！"})).into_response();
@@ -715,7 +720,7 @@ async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req
     add_iptables_rule(&rule);
     data.rules.push(rule.clone());
     
-    if data.admin.udp_per_rule {
+    if udp_per_rule {
         udp_start_rule(&rule);
     } else {
         udp_merged_restart(&data.rules);
@@ -730,6 +735,8 @@ async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req
 async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, Json(reqs): Json<Vec<AddRuleReq>>) -> Response {
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
+    let udp_per_rule = data.admin.udp_per_rule;
+    
     let mut added = false;
     for req in reqs {
         let new_port = get_port(&req.listen);
@@ -741,7 +748,7 @@ async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, J
             expire_date: 0, traffic_limit: 0, traffic_used: 0, status_msg: String::new()
         };
         add_iptables_rule(&rule);
-        if data.admin.udp_per_rule {
+        if udp_per_rule {
             udp_start_rule(&rule);
         }
         data.rules.push(rule);
@@ -749,7 +756,7 @@ async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, J
     }
     
     if added { 
-        if !data.admin.udp_per_rule {
+        if !udp_per_rule {
             udp_merged_restart(&data.rules);
         }
         save_json(&data); 
@@ -774,6 +781,9 @@ async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) 
 async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
+    
+    let udp_per_rule = data.admin.udp_per_rule;
+    
     if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
         rule.enabled = !rule.enabled;
         if rule.enabled { 
@@ -783,13 +793,12 @@ async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
             remove_iptables_rule(rule);
         }
         
-        if data.admin.udp_per_rule {
+        if udp_per_rule {
             if rule.enabled { udp_start_rule(rule); } else { udp_stop_rule(&rule.id); }
         }
-        // Merged logic is handled after scope because we need immutable borrow for 'rule' above
     }
     
-    if !data.admin.udp_per_rule {
+    if !udp_per_rule {
         udp_merged_restart(&data.rules);
     }
     
@@ -802,6 +811,8 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
     let mut last_map = state.last_traffic_map.lock().unwrap();
+    
+    let udp_per_rule = data.admin.udp_per_rule;
     let mut restart_needed = false;
 
     if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
@@ -812,7 +823,7 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
         if rule.enabled {
              remove_iptables_rule(rule); 
              add_iptables_rule(rule);
-             if data.admin.udp_per_rule {
+             if udp_per_rule {
                  udp_start_rule(rule);
              } else {
                  restart_needed = true;
@@ -820,7 +831,7 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
         }
     }
     
-    if restart_needed && !data.admin.udp_per_rule {
+    if restart_needed && !udp_per_rule {
         udp_merged_restart(&data.rules);
     }
 
@@ -833,17 +844,19 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
 async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
+    // FIX: 提取 udp_per_rule
+    let udp_per_rule = data.admin.udp_per_rule;
+    
     if let Some(pos) = data.rules.iter().position(|r| r.id == id) {
         remove_iptables_rule(&data.rules[pos]);
         
-        if data.admin.udp_per_rule {
+        if udp_per_rule {
             udp_stop_rule(&data.rules[pos].id);
         }
         
         data.rules.remove(pos);
     }
-    
-    if !data.admin.udp_per_rule {
+    if !udp_per_rule {
         udp_merged_restart(&data.rules);
     }
 
@@ -856,13 +869,15 @@ async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
 async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<UpdateRuleReq>) -> Response {
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
+    
+    let udp_per_rule = data.admin.udp_per_rule;
+    
     let new_port = get_port(&req.listen);
     if data.rules.iter().any(|r| r.id != id && get_port(&r.listen) == new_port) {
         return Json(serde_json::json!({"status":"error", "message": "端口占用"})).into_response();
     }
     if let Some(idx) = data.rules.iter().position(|r| r.id == id) {
-        // Cleanup old
-        if data.admin.udp_per_rule {
+        if udp_per_rule {
             udp_stop_rule(&data.rules[idx].id);
         }
         remove_iptables_rule(&data.rules[idx]);
@@ -875,13 +890,13 @@ async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
             if rule.status_msg == "流量耗尽" && (req.traffic_limit == 0 || req.traffic_limit > rule.traffic_used) { rule.status_msg = String::new(); }
             add_iptables_rule(rule);
             
-            if data.admin.udp_per_rule {
+            if udp_per_rule {
                 udp_start_rule(rule);
             }
         }
     }
     
-    if !data.admin.udp_per_rule {
+    if !udp_per_rule {
         udp_merged_restart(&data.rules);
     }
     
@@ -910,7 +925,7 @@ async fn update_bg(cookies: Cookies, State(state): State<Arc<AppState>>, Json(re
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
-// ✅ API: Toggle UDP Mode
+
 #[derive(Deserialize)] struct UdpModeUpdate { udp_per_rule: bool }
 async fn update_udp_mode(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<UdpModeUpdate>) -> Response {
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
