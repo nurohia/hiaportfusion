@@ -128,7 +128,7 @@ cd "$WORK_DIR"
 cat > Cargo.toml <<EOF
 [package]
 name = "hipf-panel"
-version = "1.1.3"
+version = "1.1.4"
 edition = "2021"
 
 [dependencies]
@@ -159,6 +159,7 @@ const DATA_FILE: &str = "/etc/hipf/panel_data.json";
 const HAPROXY_CFG: &str = "/etc/haproxy/haproxy.cfg";
 const GOST_PRO_BIN: &str = "/usr/local/bin/hipf-gost-udp"; 
 const UDP_PID_DIR: &str = "/run/hipf-gost";
+const UDP_MERGED_PID: &str = "merged.pid";
 const CHAIN_IN: &str = "HIPF_IN";
 const CHAIN_OUT: &str = "HIPF_OUT";
 
@@ -187,9 +188,12 @@ struct AdminConfig {
     bg_pc: String,
     #[serde(default = "default_bg_mobile")]
     bg_mobile: String,
+    #[serde(default = "default_udp_per_rule")]
+    udp_per_rule: bool,
 }
 fn default_bg_pc() -> String { "https://img.inim.im/file/1769439286929_61891168f564c650f6fb03d1962e5f37.jpeg".to_string() }
 fn default_bg_mobile() -> String { "https://img.inim.im/file/1764296937373_bg_m_2.png".to_string() }
+fn default_udp_per_rule() -> bool { true }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct AppData {
@@ -218,9 +222,17 @@ fn udp_pid_path(rule_id: &str) -> String {
     format!("{}/hipf_{}.pid", UDP_PID_DIR, rule_id)
 }
 
+fn merged_pid_path() -> String {
+    format!("{}/{}", UDP_PID_DIR, UDP_MERGED_PID)
+}
+
 fn read_pid(rule_id: &str) -> Option<i32> {
     let p = udp_pid_path(rule_id);
     fs::read_to_string(p).ok()?.trim().parse::<i32>().ok()
+}
+
+fn read_merged_pid() -> Option<i32> {
+    fs::read_to_string(merged_pid_path()).ok()?.trim().parse::<i32>().ok()
 }
 
 fn write_pid(rule_id: &str, pid: u32) {
@@ -228,9 +240,17 @@ fn write_pid(rule_id: &str, pid: u32) {
     let _ = fs::write(p, pid.to_string());
 }
 
+fn write_merged_pid(pid: u32) {
+    let _ = fs::write(merged_pid_path(), pid.to_string());
+}
+
 fn remove_pid(rule_id: &str) {
     let p = udp_pid_path(rule_id);
     let _ = fs::remove_file(p);
+}
+
+fn remove_merged_pid() {
+    let _ = fs::remove_file(merged_pid_path());
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -244,7 +264,6 @@ fn udp_start_rule(rule: &Rule) {
     let bind_addr = normalize_addr(&rule.listen);
     let remote_addr = normalize_addr(&rule.remote);
     
-    // Check if running
     if let Some(pid) = read_pid(&rule.id) {
         if pid_alive(pid) { return; } 
         remove_pid(&rule.id); 
@@ -260,12 +279,8 @@ fn udp_start_rule(rule: &Rule) {
         .stderr(std::process::Stdio::null())
         .spawn() 
     {
-        Ok(child) => {
-             write_pid(&rule.id, child.id());
-        },
-        Err(e) => {
-            eprintln!("ERROR: Failed to start UDP rule '{}' ({}): {}", rule.name, rule.listen, e);
-        }
+        Ok(child) => { write_pid(&rule.id, child.id()); },
+        Err(e) => { eprintln!("ERROR: Failed to start UDP rule '{}': {}", rule.name, e); }
     }
 }
 
@@ -276,6 +291,53 @@ fn udp_stop_rule(rule_id: &str) {
         }
     }
     remove_pid(rule_id);
+}
+
+
+fn udp_merged_stop() {
+    if let Some(pid) = read_merged_pid() {
+        if pid_alive(pid) {
+            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+        }
+    }
+    remove_merged_pid();
+}
+
+fn udp_merged_start(rules: &Vec<Rule>) {
+    if let Some(pid) = read_merged_pid() {
+       if pid_alive(pid) { return; }
+       remove_merged_pid();
+   }
+
+    ensure_pid_dir();
+    let mut args: Vec<String> = vec![];
+    for r in rules {
+        if !r.enabled { continue; }
+        let bind_addr = normalize_addr(&r.listen);
+        let remote_addr = normalize_addr(&r.remote);
+        let gost_target = format!("udp://{}/{}", bind_addr, remote_addr);
+        args.push("-L".to_string());
+        args.push(gost_target);
+    }
+    if args.is_empty() { return; }
+
+    let mut cmd = Command::new(GOST_PRO_BIN);
+    for a in args { cmd.arg(a); }
+
+    match cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => write_merged_pid(child.id()),
+        Err(e) => eprintln!("ERROR: Failed to start merged UDP gost: {}", e),
+    }
+}
+
+fn udp_merged_restart(rules: &Vec<Rule>) {
+    udp_merged_stop();
+    udp_merged_start(rules);
 }
 
 fn udp_stop_all(_: &Vec<Rule>) {
@@ -311,15 +373,16 @@ async fn main() {
     init_firewall_chains();
     
     let initial_data = load_or_init_data();
+
+    apply_backend_config(&initial_data.rules); 
     
-    // Startup Sequence
-    apply_backend_config(&initial_data.rules); // TCP
-    
-    // UDP: Directory Sweep Clean (Remove orphans)
     udp_stop_all(&initial_data.rules); 
     
-    // UDP: Start valid rules
-    udp_start_all(&initial_data.rules);
+    if initial_data.admin.udp_per_rule {
+        udp_start_all(&initial_data.rules);
+    } else {
+        udp_merged_start(&initial_data.rules);
+    }
 
     let state = Arc::new(AppState {
         data: Mutex::new(initial_data),
@@ -356,6 +419,7 @@ async fn main() {
         .route("/api/rules/:id/reset_traffic", post(reset_traffic))
         .route("/api/admin/account", post(update_account))
         .route("/api/admin/bg", post(update_bg))
+        .route("/api/admin/udp_mode", post(update_udp_mode))
         .route("/api/backup", get(download_backup))
         .route("/api/restore", post(restore_backup))
         .route("/logout", post(logout_action))
@@ -508,6 +572,7 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
     let now = Utc::now().timestamp_millis() as u64;
     let mut changed = false;
     let mut need_apply_haproxy = false;
+    let mut need_merged_restart = false;
     
     for rule in data.rules.iter_mut() {
         if !rule.enabled { continue; }
@@ -538,14 +603,22 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
         if should_stop {
             rule.enabled = false;
             changed = true;
-            need_apply_haproxy = true; // HAProxy needs reload to stop listener
+            need_apply_haproxy = true;
             remove_iptables_rule(rule);
-            udp_stop_rule(&rule.id);   // Stop only this UDP process
+            
+            if data.admin.udp_per_rule {
+                udp_stop_rule(&rule.id);
+            } else {
+                need_merged_restart = true;
+            }
         }
     }
     
     if changed { save_json(&data); }
     if need_apply_haproxy { apply_backend_config(&data.rules); }
+    if need_merged_restart && !data.admin.udp_per_rule {
+        udp_merged_restart(&data.rules);
+    }
 }
 
 fn load_or_init_data() -> AppData {
@@ -557,6 +630,7 @@ fn load_or_init_data() -> AppData {
         pass_hash: std::env::var("PANEL_PASS").unwrap_or("123456".to_string()),
         bg_pc: default_bg_pc(),
         bg_mobile: default_bg_mobile(),
+        udp_per_rule: true,
     };
     let data = AppData { admin, rules: Vec::new() };
     save_json(&data);
@@ -641,8 +715,12 @@ async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req
     add_iptables_rule(&rule);
     data.rules.push(rule.clone());
     
-    // Config: Start single UDP + Reload HAProxy
-    udp_start_rule(&rule);
+    if data.admin.udp_per_rule {
+        udp_start_rule(&rule);
+    } else {
+        udp_merged_restart(&data.rules);
+    }
+
     save_json(&data);
     apply_backend_config(&data.rules);
     
@@ -663,11 +741,20 @@ async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, J
             expire_date: 0, traffic_limit: 0, traffic_used: 0, status_msg: String::new()
         };
         add_iptables_rule(&rule);
-        udp_start_rule(&rule);
+        if data.admin.udp_per_rule {
+            udp_start_rule(&rule);
+        }
         data.rules.push(rule);
         added = true;
     }
-    if added { save_json(&data); apply_backend_config(&data.rules); }
+    
+    if added { 
+        if !data.admin.udp_per_rule {
+            udp_merged_restart(&data.rules);
+        }
+        save_json(&data); 
+        apply_backend_config(&data.rules); 
+    }
     Json(serde_json::json!({"status":"ok", "message": "批量添加完成"})).into_response()
 }
 
@@ -676,7 +763,6 @@ async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) 
     let mut data = state.data.lock().unwrap();
     flush_iptables_chains();
     
-    // Stop ALL UDP processes (Clean sweep)
     udp_stop_all(&data.rules);
     
     data.rules.clear();
@@ -693,14 +779,22 @@ async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
         if rule.enabled { 
             rule.status_msg = String::new(); 
             add_iptables_rule(rule);
-            udp_start_rule(rule); // Only start this one
         } else { 
             remove_iptables_rule(rule);
-            udp_stop_rule(&rule.id); // Only stop this one
         }
-        save_json(&data);
-        apply_backend_config(&data.rules); // Reload HAProxy (TCP needs global reload)
+        
+        if data.admin.udp_per_rule {
+            if rule.enabled { udp_start_rule(rule); } else { udp_stop_rule(&rule.id); }
+        }
+        // Merged logic is handled after scope because we need immutable borrow for 'rule' above
     }
+    
+    if !data.admin.udp_per_rule {
+        udp_merged_restart(&data.rules);
+    }
+    
+    save_json(&data);
+    apply_backend_config(&data.rules);
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
@@ -708,21 +802,31 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
     let mut last_map = state.last_traffic_map.lock().unwrap();
+    let mut restart_needed = false;
+
     if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
         rule.traffic_used = 0; rule.status_msg = String::new();
         let port = get_port(&rule.listen);
         if !port.is_empty() { last_map.remove(&port); }
         
         if rule.enabled {
-             // Re-ensure iptables and processes are active (in case it was disabled by limit)
              remove_iptables_rule(rule); 
              add_iptables_rule(rule);
-             udp_start_rule(rule); // Ensure it's running
+             if data.admin.udp_per_rule {
+                 udp_start_rule(rule);
+             } else {
+                 restart_needed = true;
+             }
         }
-        save_json(&data);
-        // Maybe Apply? If it was disabled by traffic limit, we might need to apply backend config to re-enable TCP.
-        if rule.enabled { apply_backend_config(&data.rules); }
     }
+    
+    if restart_needed && !data.admin.udp_per_rule {
+        udp_merged_restart(&data.rules);
+    }
+
+    save_json(&data);
+    // If re-enabled, we might need to apply TCP config
+    apply_backend_config(&data.rules);
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
@@ -731,9 +835,18 @@ async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
     let mut data = state.data.lock().unwrap();
     if let Some(pos) = data.rules.iter().position(|r| r.id == id) {
         remove_iptables_rule(&data.rules[pos]);
-        udp_stop_rule(&data.rules[pos].id); // Stop single UDP process
+        
+        if data.admin.udp_per_rule {
+            udp_stop_rule(&data.rules[pos].id);
+        }
+        
         data.rules.remove(pos);
     }
+    
+    if !data.admin.udp_per_rule {
+        udp_merged_restart(&data.rules);
+    }
+
     save_json(&data);
     apply_backend_config(&data.rules);
     Json(serde_json::json!({"status":"ok"})).into_response()
@@ -748,8 +861,10 @@ async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
         return Json(serde_json::json!({"status":"error", "message": "端口占用"})).into_response();
     }
     if let Some(idx) = data.rules.iter().position(|r| r.id == id) {
-        // Stop old UDP
-        udp_stop_rule(&data.rules[idx].id);
+        // Cleanup old
+        if data.admin.udp_per_rule {
+            udp_stop_rule(&data.rules[idx].id);
+        }
         remove_iptables_rule(&data.rules[idx]);
         
         let rule = &mut data.rules[idx];
@@ -759,11 +874,19 @@ async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
         if rule.enabled {
             if rule.status_msg == "流量耗尽" && (req.traffic_limit == 0 || req.traffic_limit > rule.traffic_used) { rule.status_msg = String::new(); }
             add_iptables_rule(rule);
-            udp_start_rule(rule); // Start new UDP config
+            
+            if data.admin.udp_per_rule {
+                udp_start_rule(rule);
+            }
         }
-        save_json(&data);
-        apply_backend_config(&data.rules);
     }
+    
+    if !data.admin.udp_per_rule {
+        udp_merged_restart(&data.rules);
+    }
+    
+    save_json(&data);
+    apply_backend_config(&data.rules);
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
@@ -787,6 +910,28 @@ async fn update_bg(cookies: Cookies, State(state): State<Arc<AppState>>, Json(re
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
+// ✅ API: Toggle UDP Mode
+#[derive(Deserialize)] struct UdpModeUpdate { udp_per_rule: bool }
+async fn update_udp_mode(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req): Json<UdpModeUpdate>) -> Response {
+    if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
+
+    let mut data = state.data.lock().unwrap();
+    data.admin.udp_per_rule = req.udp_per_rule;
+    save_json(&data);
+
+    // Stop everything (clean sweep)
+    udp_stop_all(&data.rules);
+    
+    // Start based on new mode
+    if data.admin.udp_per_rule {
+        udp_start_all(&data.rules);
+    } else {
+        udp_merged_start(&data.rules);
+    }
+
+    Json(serde_json::json!({"status":"ok"})).into_response()
+}
+
 async fn download_backup(cookies: Cookies, State(state): State<Arc<AppState>>) -> Response {
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let data = state.data.lock().unwrap();
@@ -804,15 +949,18 @@ async fn restore_backup(cookies: Cookies, State(state): State<Arc<AppState>>, Js
     if backup_rules.is_empty() { return Json(serde_json::json!({"status": "error", "message": "导入的数据为空"})).into_response(); }
     
     flush_iptables_chains();
-    udp_stop_all(&data.rules); // Clean sweep everything
+    udp_stop_all(&data.rules); 
 
     data.rules = backup_rules;
-
     save_json(&data);
     
-    // Apply new configs
     apply_backend_config(&data.rules);
-    udp_start_all(&data.rules);
+    
+    if data.admin.udp_per_rule {
+        udp_start_all(&data.rules);
+    } else {
+        udp_merged_start(&data.rules);
+    }
 
     for r in &data.rules { if r.enabled { add_iptables_rule(r); } }
 
@@ -842,16 +990,37 @@ td:last-child{border-right:1px solid rgba(255,255,255,0.3);border-top-right-radi
 @media(max-width:768px){.grid-input{grid-template-columns:1fr; gap:10px}.navbar{padding:0.8rem 1rem}.nav-text{display:none}thead{display:none}tbody tr{display:flex;flex-direction:column;border-radius:18px!important;margin-bottom:12px;padding:15px;border:1px solid rgba(255,255,255,0.3);background:rgba(255,255,255,0.4)}td{padding:6px 0;display:flex;justify-content:space-between;border-radius:0!important;align-items:center;border:none;background:transparent}td::before{content:attr(data-label);color:#9ca3af;font-size:0.85rem}td[data-label="操作"]{justify-content:flex-end;gap:10px;margin-top:8px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.05)}td[data-label="操作"] .btn{flex:none;width:auto;padding:6px 14px;border-radius:8px;font-size:0.85rem}td[data-label="操作"] .btn-gray{background:transparent;border:1px solid rgba(0,0,0,0.15);color:#555}td[data-label="操作"] .btn-primary{background:var(--primary);color:white}td[data-label="操作"] .btn-danger{background:rgba(239,68,68,0.1);color:var(--danger);border:1px solid rgba(239,68,68,0.2)}.tools-group{width:100%;margin-top:5px}.tools-group .btn{flex:1;justify-content:center;padding:10px 0;font-size:0.85rem}}</style></head><body><div class="navbar"><div class="brand"><i class="fas fa-network-wired"></i> <span class="nav-text">HiaPortFusion</span></div><div class="nav-actions" style="display:flex;gap:15px"><button class="btn btn-gray" onclick="openSettings()"><i class="fas fa-sliders-h"></i> <span class="nav-text">设置</span></button><button class="btn btn-danger" onclick="doLogout()"><i class="fas fa-power-off"></i></button></div></div><div class="container"><div class="card card-fixed"><div class="grid-input"><input id="n" placeholder="备注名称"><input id="l" placeholder="监听端口 (如 10000)"><input id="r" placeholder="目标 (例 1.2.3.4:443)"><button class="btn btn-primary" onclick="openAddModal()"><i class="fas fa-plus"></i> 添加</button><div class="tools-group"><button class="btn btn-primary" onclick="openBatch()" style="background:#8b5cf6"><i class="fas fa-paste"></i> 批量</button><button class="btn btn-danger" onclick="delAll()" style="background:#ef4444"><i class="fas fa-trash"></i> 全删</button><button class="btn btn-primary" onclick="downloadBackup()" style="background:#059669"><i class="fas fa-download"></i> 导出</button><button class="btn btn-danger" onclick="openRestore()" style="background:#d97706"><i class="fas fa-upload"></i> 导入</button></div></div></div><div class="card card-scroll"><div style="padding:1.2rem 1.5rem;font-weight:700;font-size:1rem;opacity:0.8">转发规则 (TCP+UDP)</div><div class="table-wrapper"><table id="ruleTable"><thead><tr><th>状态</th><th>备注</th><th>监听</th><th>目标</th><th>流量 (In/Out)</th><th style="width:180px;text-align:right;padding-right:20px">操作</th></tr></thead><tbody id="list"></tbody></table><div id="emptyView" style="display:none;text-align:center;padding:50px;color:#9ca3af"><i class="fas fa-inbox" style="font-size:2rem;display:block;margin-bottom:10px"></i>暂无规则</div></div></div></div>
 <div id="ruleModal" class="modal"><div class="modal-box"><h3 id="modalTitle">添加规则</h3><input type="hidden" id="edit_id"><label>备注</label><input id="mod_n"><label>监听端口 (可填 IP:PORT 或 PORT)</label><input id="mod_l"><label>目标地址 (IP:PORT)</label><input id="mod_r"><label>到期时间 (留空不限制)</label><input type="datetime-local" id="mod_e"><label>流量限制 (留空或0不限制)</label><div style="display:flex;gap:10px"><input id="mod_t_val" type="number" placeholder="数值" style="flex:1"><select id="mod_t_unit" style="padding:10px;border-radius:10px;border:1px solid rgba(0,0,0,0.05);background:rgba(255,255,255,0.5)"><option value="MB">MB</option><option value="GB">GB</option></select></div><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveRule()">保存</button></div></div></div>
 <div id="viewModal" class="modal"><div class="modal-box"><h3 style="margin-bottom:20px;border-bottom:1px solid #eee;padding-bottom:10px">规则详情</h3><div class="info-row"><span>备注</span><span class="info-val" id="view_n"></span></div><div class="info-row"><span>监听</span><span class="info-val" id="view_l"></span></div><div class="info-row"><span>目标</span><span class="info-val" id="view_r"></span></div><div style="margin:15px 0;border-top:1px dashed #ddd;padding-top:10px"></div><div id="view_expire_sec"><div class="info-row"><span>到期时间</span><span class="info-val" id="view_e_date"></span></div><div style="text-align:right;font-size:0.8rem;color:#666" id="view_e_remain"></div></div><div style="margin:15px 0;border-top:1px dashed #ddd;padding-top:10px"></div><div id="view_traffic_sec"><div class="info-row"><span>流量使用 (Max)</span><span class="info-val"><span id="view_t_used"></span> / <span id="view_t_limit"></span></span></div><div class="progress-bar"><div class="progress-fill" id="view_t_bar"></div></div><div style="text-align:right;margin-top:5px"><button class="btn btn-gray" style="font-size:0.7rem;padding:4px 8px" onclick="resetTraffic()">重置流量</button></div></div><div style="margin-top:25px;display:flex;justify-content:flex-end;"><button class="btn btn-primary" onclick="closeModal()">关闭</button></div></div></div>
-<div id="setModal" class="modal"><div class="modal-box"><div class="tab-header"><div class="tab-btn active" onclick="switchTab(0)">管理账户</div><div class="tab-btn" onclick="switchTab(1)">个性背景</div></div><div class="tab-content active" id="tab0"><label>用户名</label><input id="set_u" value="{{USER}}"><label>重置密码 (留空保持不变)</label><input id="set_p" type="password"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveAccount()">确认修改</button></div></div><div class="tab-content" id="tab1"><label>PC端壁纸 URL</label><input id="bg_pc" value="{{BG_PC}}"><label>手机端壁纸 URL</label><input id="bg_mob" value="{{BG_MOBILE}}"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBg()">应用背景</button></div></div></div></div>
+<div id="setModal" class="modal"><div class="modal-box">
+    <div class="tab-header">
+        <div class="tab-btn active" onclick="switchTab(0)">管理账户</div>
+        <div class="tab-btn" onclick="switchTab(1)">个性背景</div>
+        <div class="tab-btn" onclick="switchTab(2)">UDP 模式</div>
+    </div>
+    <div class="tab-content active" id="tab0"><label>用户名</label><input id="set_u" value="{{USER}}"><label>重置密码 (留空保持不变)</label><input id="set_p" type="password"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveAccount()">确认修改</button></div></div>
+    <div class="tab-content" id="tab1"><label>PC端壁纸 URL</label><input id="bg_pc" value="{{BG_PC}}"><label>手机端壁纸 URL</label><input id="bg_mob" value="{{BG_MOBILE}}"><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBg()">应用背景</button></div></div>
+    <div class="tab-content" id="tab2">
+        <label>UDP 转发进程模式</label>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-radius:12px;background:rgba(0,0,0,0.03);">
+            <div style="line-height:1.4">
+                <div style="font-weight:600">一个规则一个进程</div>
+                <div style="font-size:0.85rem;color:#6b7280">开：更稳更隔离（占内存多）<br>关：合并为一个进程（省内存，变更会重启UDP）</div>
+            </div>
+            <input id="udp_mode_sw" type="checkbox" style="width:48px;height:22px" onchange="saveUdpMode()">
+        </div>
+        <div style="margin-top:18px;display:flex;justify-content:flex-end;gap:12px">
+            <button class="btn btn-gray" onclick="closeModal()">关闭</button>
+        </div>
+    </div>
+</div></div>
 <div id="batchModal" class="modal"><div class="modal-box" style="max-width:600px"><h3>批量添加规则</h3><p style="color:#666;font-size:0.85rem;margin-bottom:10px">格式：备注,监听端口,目标地址<br>一行一条，例如：<br>日本落地,10001,1.1.1.1:443</p><textarea id="batch_input" rows="10" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-family:monospace" placeholder="备注,监听端口,目标地址"></textarea><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveBatch()">开始导入</button></div></div></div>
 <div id="restoreModal" class="modal"><div class="modal-box"><h3>恢复备份</h3><p style="color:#ef4444;font-size:0.9rem;margin-bottom:15px">警告：导入操作将覆盖当前所有规则！</p><textarea id="restore_input" rows="8" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-family:monospace;font-size:0.8rem"></textarea><div style="margin-top:25px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-danger" onclick="doRestore()">确认覆盖</button></div></div></div>
 <script>
-let rules=[];let curId=null;
+let rules=[];let curId=null;let adminCfg=null;
 const $=id=>document.getElementById(id);
 const fmtBytes=b=>{if(b===0)return'0 B';const k=1024,dm=2,sizes=['B','KB','MB','GB','TB'],i=Math.floor(Math.log(b)/Math.log(k));return parseFloat((b/Math.pow(k,i)).toFixed(dm))+' '+sizes[i]};
 const fmtDate=ts=>{if(!ts)return'永久有效';return new Date(ts).toLocaleString()};
 const getRemain=ts=>{if(!ts)return'';const diff=ts-Date.now();if(diff<0)return'已过期';const d=Math.floor(diff/86400000);return `剩余 ${d}天`};
-async function load(){const r=await fetch('/api/rules');if(r.status===401)location.href='/login';const d=await r.json();rules=d.rules;render()}
+async function load(){const r=await fetch('/api/rules');if(r.status===401)location.href='/login';const d=await r.json();rules=d.rules;adminCfg=d.admin;render()}
 function render(){const t=$('list');const ev=$('emptyView');const table=$('ruleTable');t.innerHTML='';if(rules.length===0){ev.style.display='block';table.style.display='none'}else{ev.style.display='none';table.style.display='table';rules.forEach(r=>{const row=document.createElement('tr');if(!r.enabled)row.style.opacity='0.6';
 let statusHtml=`<span class="status-dot ${r.enabled?'bg-green':'bg-gray'}"></span>${r.enabled?'运行中':'暂停'}`;
 if(r.status_msg) statusHtml+=` <span style="font-size:0.8rem;color:#ef4444">(${r.status_msg})</span>`;
@@ -888,7 +1057,8 @@ async function saveRule(){
 async function resetTraffic(){if(!curId||!confirm('确定重置已用流量统计吗？'))return;await fetch(`/api/rules/${curId}/reset_traffic`,{method:'POST'});closeModal();load()}
 async function tog(id){await fetch(`/api/rules/${id}/toggle`,{method:'POST'});load()}
 async function del(id){if(confirm('确定删除此规则吗？'))await fetch(`/api/rules/${id}`,{method:'DELETE'});load()}
-function openSettings(){$('setModal').style.display='flex';switchTab(0)}
+function openSettings(){$('setModal').style.display='flex';switchTab(0);if(adminCfg){$('udp_mode_sw').checked=(adminCfg.udp_per_rule!==false)}else{$('udp_mode_sw').checked=true}}
+async function saveUdpMode(){const on=$('udp_mode_sw').checked;if(!confirm(on?'切换为：一个规则一个 UDP 进程？':'切换为：合并为一个 gost 进程？（将重启 UDP 转发）')){$('udp_mode_sw').checked=!on;return}const res=await fetch('/api/admin/udp_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({udp_per_rule:on})});if(!res.ok){alert('切换失败');$('udp_mode_sw').checked=!on;return}if(adminCfg)adminCfg.udp_per_rule=on;alert('已切换（UDP 转发已应用）')}
 function closeModal(){document.querySelectorAll('.modal').forEach(x=>x.style.display='none')}
 function switchTab(idx){document.querySelectorAll('.tab-btn').forEach((b,i)=>b.classList.toggle('active',i===idx));document.querySelectorAll('.tab-content').forEach((c,i)=>c.classList.toggle('active',i===idx))}
 async function saveAccount(){await fetch('/api/admin/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('set_u').value,password:$('set_p').value})});alert('账户已更新，请重新登录');location.href='/login'}
