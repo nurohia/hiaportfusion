@@ -44,37 +44,23 @@ task_fail() {
 # =================环境准备与依赖安装=================
 install_dependencies() {
     task_start "正在初始化环境与依赖 (HAProxy, GOST, Rust)"
-
-    systemctl stop hipf-panel >/dev/null 2>&1 || true
-    systemctl stop haproxy >/dev/null 2>&1 || true
-    pkill -f "/usr/local/bin/hipf-gost-udp" >/dev/null 2>&1 || true
-    rm -rf /run/hipf-gost >/dev/null 2>&1 || true
-
+    
     # 1. 系统包
     if [ -f /etc/debian_version ]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y >/dev/null 2>&1
-        apt-get install -y haproxy ca-certificates curl wget tar git \
-            build-essential pkg-config libssl-dev iptables >/dev/null 2>&1
+        apt-get install -y haproxy ca-certificates curl wget tar git build-essential pkg-config libssl-dev iptables >/dev/null 2>&1
     elif [ -f /etc/redhat-release ]; then
-        yum install -y haproxy ca-certificates curl wget tar git \
-            gcc gcc-c++ make pkgconfig openssl-devel iptables-services >/dev/null 2>&1
+        yum install -y haproxy ca-certificates curl wget tar git gcc gcc-c++ make pkgconfig openssl-devel iptables-services >/dev/null 2>&1
     fi
 
     # 2. 安装 GOST 并创建专用副本
     if [ ! -f "$GOST_RAW_BIN" ]; then
         ARCH=$(uname -m)
         case $ARCH in
-            x86_64|amd64)
-                GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz"
-                ;;
-            aarch64|arm64)
-                GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_arm64.tar.gz"
-                ;;
-            *)
-                echo -e "${RED}不支持的架构: $ARCH${RESET}"
-                exit 1
-                ;;
+            x86_64|amd64) GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz" ;;
+            aarch64|arm64) GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_arm64.tar.gz" ;;
+            *) echo -e "${RED}不支持的架构: $ARCH${RESET}"; exit 1 ;;
         esac
         wget -O /tmp/gost.tar.gz "$GOST_URL" >/dev/null 2>&1
         tar -xf /tmp/gost.tar.gz -C /tmp
@@ -88,18 +74,18 @@ install_dependencies() {
 
     # 3. 安装 Rust
     if ! command -v cargo >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y >/dev/null 2>&1
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y >/dev/null 2>&1
+        source "$HOME/.cargo/env"
+    else
+        source "$HOME/.cargo/env"
     fi
-    source "$HOME/.cargo/env"
 
-    # 4. 初始化目录 & haproxy 最小配置
+    # 4. 初始化目录
     mkdir -p /etc/hipf
-    mkdir -p "$(dirname "$HAPROXY_CFG")"
-
-    rm -f "$HAPROXY_CFG"
-
-    cat > "$HAPROXY_CFG" <<'EOF'
+    mkdir -p "$(dirname $HAPROXY_CFG)"
+    
+    if [ ! -f "$HAPROXY_CFG" ] || [ ! -s "$HAPROXY_CFG" ]; then
+        cat > "$HAPROXY_CFG" <<EOF
 global
     daemon
     maxconn 10240
@@ -110,24 +96,13 @@ defaults
     timeout client  60s
     timeout server  60s
 EOF
-
-    systemctl enable haproxy >/dev/null 2>&1 || true
-
-    if ! haproxy -c -f "$HAPROXY_CFG" >/dev/null 2>&1; then
-        echo -e "${RED}haproxy 配置校验失败${RESET}"
-        haproxy -c -f "$HAPROXY_CFG" || true
-        exit 1
     fi
-
-    systemctl restart haproxy >/dev/null 2>&1 || {
-        echo -e "${RED}haproxy 启动失败${RESET}"
-        systemctl status haproxy --no-pager || true
-        journalctl -u haproxy -n 50 --no-pager || true
-        exit 1
-    }
+    systemctl enable haproxy >/dev/null 2>&1
+    systemctl restart haproxy
 
     task_finish
 }
+
 
 # =================主逻辑=================
 
