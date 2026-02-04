@@ -114,9 +114,16 @@ check_status() {
     echo -e "--------------------"
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         echo -e "运行状态: ${GREEN}运行中 (Active)${RESET}"
-        local PORT=$(grep "PANEL_PORT=" "$SERVICE_FILE" | cut -d'=' -f2 | tr -d '"')
-        echo -e "监听端口: ${CYAN}$PORT${RESET}"
-        echo -e "访问地址: ${YELLOW}http://$(get_ip):$PORT${RESET}"
+        local CURRENT_PORT=""
+    CURRENT_PORT=$(systemctl show "$SERVICE_NAME" --property=Environment 2>/dev/null \
+        | sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' | head -n1)
+
+    if [ -z "$CURRENT_PORT" ]; then
+        CURRENT_PORT=$(sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' "$SERVICE_FILE" 2>/dev/null | head -n1)
+    fi
+    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="(未知)"
+        echo -e "监听端口: ${GREEN}${CURRENT_PORT}${RESET}"
+        echo -e "访问地址: ${YELLOW}http://$(get_ip):$CURRENT_PORT${RESET}"
     else
         echo -e "运行状态: ${RED}未运行${RESET}"
     fi
