@@ -205,11 +205,11 @@ service_control() {
             ;;
     esac
 
-    if [ "$action" != "stop" ]; then
+    if [ "$action" != "" ]; then
         echo -e "\n${GREEN}>>> 操作执行完毕。当前进程状态：${RESET}"
         echo -e "----------------------------------------"
         if pgrep -x "hipf-panel" >/dev/null; then
-            echo -e "面板进程: ${GREEN}运行中${RESET} (PID: $(pgrep -x hipf-panel))"
+            echo -e "面板进程: ${GREEN}运行中${RESET}"
         else
             echo -e "面板进程: ${RED}未运行${RESET}"
         fi
