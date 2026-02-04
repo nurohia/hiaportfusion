@@ -112,25 +112,29 @@ update_panel_port() {
 
 check_status() {
     echo -e "--------------------"
+    
+    local READ_PORT=""
+    if [ -f "$SERVICE_FILE" ]; then
+        READ_PORT=$(grep -oE 'PANEL_PORT=[0-9]+' "$SERVICE_FILE" | awk -F'=' '{print $2}' | head -n1)
+    fi
+    
+    if [ -z "$READ_PORT" ]; then
+        READ_PORT=$(systemctl show "$SERVICE_NAME" --property=Environment 2>/dev/null | grep -oE 'PANEL_PORT=[0-9]+' | awk -F'=' '{print $2}' | head -n1)
+    fi
+
+    [ -z "$READ_PORT" ] && READ_PORT="(未知)"
+
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         echo -e "运行状态: ${GREEN}运行中 (Active)${RESET}"
-        local CURRENT_PORT=""
-    CURRENT_PORT=$(systemctl show "$SERVICE_NAME" --property=Environment 2>/dev/null \
-        | sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' | head -n1)
-
-    if [ -z "$CURRENT_PORT" ]; then
-        CURRENT_PORT=$(sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' "$SERVICE_FILE" 2>/dev/null | head -n1)
-    fi
-    [ -z "$CURRENT_PORT" ] && CURRENT_PORT="(未知)"
-        echo -e "监听端口: ${GREEN}${CURRENT_PORT}${RESET}"
-        echo -e "访问地址: ${YELLOW}http://$(get_ip):$CURRENT_PORT${RESET}"
+        echo -e "监听端口: ${CYAN}${READ_PORT}${RESET}"
+        echo -e "访问地址: ${YELLOW}http://$(get_ip):${READ_PORT}${RESET}"
     else
         echo -e "运行状态: ${RED}未运行${RESET}"
+        echo -e "配置端口: ${CYAN}${READ_PORT}${RESET}"
     fi
     echo -e "--------------------"
     read -p "按回车键返回..."
 }
-
 view_logs() {
     echo -e "${YELLOW}正在打开日志 (按 Ctrl+C 退出)...${RESET}"
     journalctl -u "$SERVICE_NAME" -f
