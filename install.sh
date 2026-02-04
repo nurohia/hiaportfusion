@@ -44,7 +44,7 @@ get_ip() {
 
 update_panel_port() {
     if [ ! -f "$SERVICE_FILE" ]; then
-        echo -e "${RED}错误：检测到面板尚未安装，请先执行安装！${RESET}"
+        echo -e "${RED}检测到面板尚未安装，请先执行安装！${RESET}"
         read -p "按回车键返回..."
         return
     fi
@@ -141,6 +141,11 @@ view_logs() {
 }
 
 service_control() {
+    if [ ! -f "$SERVICE_FILE" ]; then
+        echo -e "${RED}检测到面板尚未安装，请先执行安装！${RESET}"
+        read -p "按回车键返回..."
+        return
+    fi
     local action="$1"
     echo -e "${YELLOW}正在执行 $action ...${RESET}"
 
