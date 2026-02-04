@@ -159,13 +159,14 @@ service_control() {
             ;;
 
         start)
+            echo -e "${CYAN}>>> 1. 清理残留进程...${RESET}"
             pkill -KILL -f "hipf-gost-udp" >/dev/null 2>&1 || true
             
             echo -e "${CYAN}>>> 2. 启动 HAProxy (TCP引擎)...${RESET}"
             if haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
                 systemctl start haproxy || echo -e "${RED}HAProxy 启动失败 (非致命)${RESET}"
             else
-                echo -e "${YELLOW}HAProxy 配置校验未通过，面板启动后将自动修复...${RESET}"
+                echo -e "${YELLOW}HAProxy 配置校验未通过，尝试强制启动...${RESET}"
                 systemctl start haproxy >/dev/null 2>&1 || true
             fi
             
@@ -176,19 +177,27 @@ service_control() {
             if ! systemctl is-active --quiet "$SERVICE_NAME"; then
                 echo -e "${RED}❌ 启动失败！查看日志：${RESET}"
                 journalctl -u "$SERVICE_NAME" -n 20 --no-pager
-                return 1
             fi
             ;;
 
         restart)
             echo -e "${YELLOW}>>> 正在执行 重启 流程...${RESET}"
             
-            service_control stop
+            systemctl stop "$SERVICE_NAME" || true
+            pkill -KILL -f "hipf-gost-udp" >/dev/null 2>&1 || true
+            systemctl stop haproxy >/dev/null 2>&1 || true
             
-            echo -e "${YELLOW}>>> 等待端口释放 (2秒)...${RESET}"
+            echo -e "${YELLOW}>>> 等待端口释放...${RESET}"
             sleep 2
             
-            service_control start
+            systemctl start haproxy >/dev/null 2>&1 || true
+            systemctl start "$SERVICE_NAME"
+            
+            sleep 2
+            if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+                echo -e "${RED}❌ 重启失败！查看日志：${RESET}"
+                journalctl -u "$SERVICE_NAME" -n 20 --no-pager
+            fi
             ;;
 
         *)
@@ -197,28 +206,16 @@ service_control() {
     esac
 
     if [ "$action" != "stop" ]; then
-        echo -e "${GREEN}>>> 操作执行完毕。当前进程状态：${RESET}"
+        echo -e "\n${GREEN}>>> 操作执行完毕。当前进程状态：${RESET}"
         echo -e "----------------------------------------"
         if pgrep -x "hipf-panel" >/dev/null; then
             echo -e "面板进程: ${GREEN}运行中${RESET} (PID: $(pgrep -x hipf-panel))"
         else
             echo -e "面板进程: ${RED}未运行${RESET}"
         fi
-        
-        local UDP_COUNT=$(pgrep -f "hipf-gost-udp" | wc -l)
-        if [ "$UDP_COUNT" -gt 0 ]; then
-            echo -e "UDP 转发: ${GREEN}运行中${RESET} (共 $UDP_COUNT 个进程)"
-        else
-            echo -e "UDP 转发: ${YELLOW}无活跃进程 (或无规则)${RESET}"
-        fi
-        
-        if systemctl is-active --quiet haproxy; then
-            echo -e "TCP 引擎: ${GREEN}运行中${RESET}"
-        else
-            echo -e "TCP 引擎: ${RED}未运行${RESET}"
-        fi
         echo -e "----------------------------------------"
     fi
+    read -p "按回车键返回..."
 }
 
 
