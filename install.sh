@@ -141,12 +141,57 @@ view_logs() {
 }
 
 service_control() {
-    local action=$1
+    local action="$1"
     echo -e "${YELLOW}正在执行 $action ...${RESET}"
-    systemctl "$action" "$SERVICE_NAME"
+
+    case "$action" in
+        stop)
+            systemctl stop "$SERVICE_NAME" || true
+            pkill -TERM -x hipf-gost-udp 2>/dev/null || true
+            sleep 1
+            pkill -KILL -x hipf-gost-udp 2>/dev/null || true
+
+            echo -e "${CYAN}>>> 已停止面板并清理相关进程。${RESET}"
+            ;;
+
+        start)
+            if command -v haproxy >/dev/null 2>&1; then
+                haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 && {
+                    systemctl start haproxy >/dev/null 2>&1 || true
+                }
+            fi
+
+            systemctl start "$SERVICE_NAME" || {
+                echo -e "${RED}❌ 启动失败：${RESET}"
+                systemctl status "$SERVICE_NAME" --no-pager -l || true
+                journalctl -u "$SERVICE_NAME" -n 60 --no-pager || true
+                return 1
+            }
+            ;;
+
+        restart)
+            systemctl restart "$SERVICE_NAME" || {
+                echo -e "${RED}❌ 重启失败：${RESET}"
+                systemctl status "$SERVICE_NAME" --no-pager -l || true
+                journalctl -u "$SERVICE_NAME" -n 60 --no-pager || true
+                return 1
+            }
+            ;;
+
+        *)
+            systemctl "$action" "$SERVICE_NAME" || return 1
+            ;;
+    esac
+
     echo -e "${GREEN}执行完成${RESET}"
+    echo -e "${CYAN}--- 当前状态 ---${RESET}"
+    systemctl is-active "$SERVICE_NAME" || true
+    systemctl show "$SERVICE_NAME" -p MainPID --value 2>/dev/null | sed 's/^/MainPID: /' || true
+    pgrep -ax hipf-panel 2>/dev/null || true
+    pgrep -ax hipf-gost-udp 2>/dev/null || true
     sleep 1
 }
+
 
 # ================= 备份与恢复逻辑 =================
 
