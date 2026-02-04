@@ -5,7 +5,7 @@ set -e
 PANEL_PORT="4796"
 DEFAULT_USER="admin"
 DEFAULT_PASS="123456"
-
+ 
 # 核心路径
 WORK_DIR="/opt/hipf_panel"
 PANEL_BIN="/usr/local/bin/hipf-panel"
