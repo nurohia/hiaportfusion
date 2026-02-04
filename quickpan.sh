@@ -26,7 +26,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 echo -e "${GREEN}==========================================${RESET}"
-echo -e "${GREEN}    HiaPortFusion 面板  ${RESET}"
+echo -e "${GREEN}            HiaPortFusion 面板            ${RESET}"
 echo -e "${GREEN}==========================================${RESET}"
 
 # 必须 root
