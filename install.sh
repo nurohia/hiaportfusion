@@ -21,7 +21,6 @@ RESET="\033[0m"
 
 # ================= 辅助函数 =================
 
-# 1. 检查 Root 权限
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}错误：请以 root 用户运行此脚本！${RESET}"
@@ -54,7 +53,6 @@ update_panel_port() {
     CURRENT_PORT=$(systemctl show "$SERVICE_NAME" --property=Environment 2>/dev/null \
         | sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' | head -n1)
 
-    # fallback
     if [ -z "$CURRENT_PORT" ]; then
         CURRENT_PORT=$(sed -n 's/.*PANEL_PORT=\([0-9]\+\).*/\1/p' "$SERVICE_FILE" 2>/dev/null | head -n1)
     fi
@@ -84,7 +82,7 @@ update_panel_port() {
     echo -e "${YELLOW}正在更新配置...${RESET}"
 
     if ! grep -qE 'Environment="PANEL_PORT=' "$SERVICE_FILE"; then
-        awk -v np="$new_port" '
+        awk -v np="$new_port" '<
             BEGIN{added=0}
             /^\[Service\]/{print; if(!added){print "Environment=\"PANEL_PORT="np"\""; added=1; next}}
             {print}
@@ -141,7 +139,6 @@ service_control() {
 
 # ================= 备份与恢复逻辑 =================
 
-# 1. 检查 Cron 依赖
 has_cron() {
     command -v crontab >/dev/null 2>&1 && return 0
     command -v cron >/dev/null 2>&1 && return 0
@@ -175,7 +172,6 @@ ensure_cron_ready() {
     return 0
 }
 
-# 2. 写入备份辅助脚本
 write_export_helper() {
     mkdir -p "$BACKUP_DIR"
     cat > "$EXPORT_HELPER" <<EOF
@@ -183,21 +179,15 @@ write_export_helper() {
 set -e
 DATA_FILE="/etc/hipf/panel_data.json"
 BACKUP_DIR="${BACKUP_DIR}"
-# 固定文件名，不带时间戳
 OUT="${DEFAULT_BACKUP_FILE}"
-
 mkdir -p "\$BACKUP_DIR"
-
 if [ -f "\$DATA_FILE" ]; then
-    # 直接覆盖打包
     tar -czf "\$OUT" -C "\$(dirname "\$DATA_FILE")" "\$(basename "\$DATA_FILE")" 2>/dev/null
 fi
-# 不执行任何删除操作，因为只有一个文件
 EOF
     chmod +x "$EXPORT_HELPER"
 }
 
-# 3. 手动备份
 manual_backup() {
     mkdir -p "$BACKUP_DIR"
     if [ ! -f "$DATA_FILE" ]; then
@@ -205,13 +195,9 @@ manual_backup() {
         read -p "按回车键返回..."
         return
     fi
-
     echo -e "${CYAN}正在备份数据...${RESET}"
     local OUT="$DEFAULT_BACKUP_FILE"
-    
-    # 覆盖式备份
     tar -czf "$OUT" -C "$(dirname "$DATA_FILE")" "$(basename "$DATA_FILE")"
-    
     if [ -s "$OUT" ]; then
         echo -e "${GREEN}✅ 备份成功 (已覆盖旧备份)！${RESET}"
         echo -e "文件路径: ${YELLOW}$OUT${RESET}"
@@ -221,60 +207,49 @@ manual_backup() {
     read -p "按回车键返回..."
 }
 
-# 4. 手动恢复
 manual_restore() {
     echo -e "${CYAN}--- 恢复备份 ---${RESET}"
     echo -e "默认备份路径: $DEFAULT_BACKUP_FILE"
     read -p "请输入备份文件路径 (直接回车使用默认): " IN
     IN="${IN:-$DEFAULT_BACKUP_FILE}"
-
     if [ ! -f "$IN" ]; then
         echo -e "${RED}错误：文件不存在: $IN${RESET}"
         read -p "按回车键返回..."
         return
     fi
-
     echo -e "${YELLOW}⚠️  警告：此操作将覆盖当前的面板数据！${RESET}"
     read -p "确认恢复吗？[y/N]: " ANS
     case "$ANS" in y|Y) ;; *) return ;; esac
-
     echo -e "${CYAN}正在恢复...${RESET}"
     tar -xzf "$IN" -C "$(dirname "$DATA_FILE")"
-    
     echo -e "${CYAN}重启面板服务...${RESET}"
     systemctl restart "$SERVICE_NAME"
-    
     echo -e "${GREEN}✅ 恢复完成！${RESET}"
     read -p "按回车键返回..."
 }
 
-# 5. FTP/SFTP 工具集成
 install_ftp(){
     clear
     echo -e "${GREEN}📂 FTP/SFTP 远程备份工具...${RESET}"
     echo -e "${YELLOW}提示：HiaPortFusion 默认备份文件路径：${DEFAULT_BACKUP_FILE}${RESET}"
     echo -e "${CYAN}正在拉取第三方备份脚本...${RESET}"
-    
     need_cmd curl
     bash <(curl -sL https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
-    
     echo -e "${GREEN}工具执行结束。${RESET}"
     read -p "按回车键返回..."
 }
 
-# 6. 定时任务管理
 cron_manager() {
     while true; do
         clear
         echo -e "${CYAN}--- 定时备份管理 ---${RESET}"
         if [ -f "$CRON_FILE" ]; then
             echo -e "当前状态: ${GREEN}已启用${RESET}"
-            echo -e "任务配置: $(cat "$CRON_FILE" | grep -vE '^#|SHELL|PATH')"
         else
             echo -e "当前状态: ${YELLOW}未启用${RESET}"
         fi
         echo -e "--------------------"
-        echo -e "1. 添加/更新 定时任务 (覆盖式备份)"
+        echo -e "1. 添加/更新 定时任务"
         echo -e "2. 删除 定时任务"
         echo -e "0. 返回上级"
         echo -e "--------------------"
@@ -283,12 +258,10 @@ cron_manager() {
             1)
                 ensure_cron_ready || break
                 write_export_helper
-                
                 echo -e "\n请选择备份频率："
                 echo "1. 每天"
                 echo "2. 每周"
                 read -p "选择 [1-2]: " FREQ
-                
                 local D="*"
                 if [ "$FREQ" = "2" ]; then
                     read -p "周几备份 (1-7, 7=周日): " WD
@@ -298,10 +271,8 @@ cron_manager() {
                          *) echo -e "${RED}无效输入${RESET}"; sleep 1; continue ;;
                     esac
                 fi
-                
                 read -p "几点备份 (0-23): " HH
                 read -p "几分备份 (0-59): " MM
-                
                 cat > "$CRON_FILE" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -328,17 +299,12 @@ backup_menu() {
         echo -e "${GREEN}==========================================${RESET}"
         echo -e "${GREEN}       备份与恢复管理 (HiaPortFusion)     ${RESET}"
         echo -e "${GREEN}==========================================${RESET}"
-        echo -e "数据文件: $DATA_FILE"
-        echo -e "备份目录: $BACKUP_DIR"
-        echo -e "当前模式: 单文件覆盖"
-        echo -e "------------------------------------------"
         echo -e "1. 手动一键备份"
         echo -e "2. 手动恢复备份"
         echo -e "3. 定时自动备份"
         echo -e "4. FTP/SFTP 远程备份工具"
-        echo -e "------------------------------------------"
         echo -e "0. 返回主菜单"
-        echo -e "${GREEN}------------------------------------------${RESET}"
+        echo -e "------------------------------------------"
         read -p "请选择 [0-4]: " OPT
         case "$OPT" in
             1) manual_backup ;;
@@ -400,7 +366,29 @@ manage_panel() {
                     read -p "按回车键继续..." 
                     ;;
                 2) 
+                    # 1. 检测是否有安装
+                    if [ -f "$SERVICE_FILE" ] || [ -f "$PANEL_BIN" ]; then
+                        echo -e "${RED}⚠️  检测到 HiaPortFusion 面板已安装！${RESET}"
+                        echo -e "------------------------------------------------"
+                        read -p "输入 'y' 卸载当前版本并继续安装，其他键取消: " UN_ACT
+                        
+                        if [[ "$UN_ACT" == "y" || "$UN_ACT" == "Y" ]]; then
+                            echo -e "${CYAN}>>> 正在启动卸载程序...${RESET}"
+                            bash <(curl -fsSL https://raw.githubusercontent.com/nurohia/hiaportfusion/main/uninstall.sh)
+                            
+                            echo -e "${GREEN}✅ 卸载流程结束。${RESET}"
+                            echo -e "${CYAN}>>> 正在自动启动自编译安装...${RESET}"
+                            sleep 2
+                        else
+                            echo -e "${RED}操作已取消。${RESET}"
+                            read -p "按回车键返回..."
+                            return
+                        fi
+                    fi
+                    
+                    echo -e "${YELLOW}>>> 开始执行自编译安装脚本...${RESET}"
                     bash <(curl -fsSL https://raw.githubusercontent.com/nurohia/hiaportfusion/main/panel.sh) 
+                    
                     read -p "按回车键继续..." 
                     ;;
                 *) ;;
