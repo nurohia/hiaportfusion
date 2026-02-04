@@ -146,50 +146,79 @@ service_control() {
 
     case "$action" in
         stop)
+            echo -e "${CYAN}>>> 1. 停止面板主服务...${RESET}"
             systemctl stop "$SERVICE_NAME" || true
-            pkill -TERM -x hipf-gost-udp 2>/dev/null || true
-            sleep 1
-            pkill -KILL -x hipf-gost-udp 2>/dev/null || true
-
-            echo -e "${CYAN}>>> 已停止面板并清理相关进程。${RESET}"
+            
+            echo -e "${CYAN}>>> 2. 停止 UDP 转发进程...${RESET}"
+            pkill -TERM -f "hipf-gost-udp" >/dev/null 2>&1 || true
+            sleep 0.5
+            pkill -KILL -f "hipf-gost-udp" >/dev/null 2>&1 || true
+            
+            echo -e "${CYAN}>>> 3. 停止 HAProxy进程...${RESET}"
+            systemctl stop haproxy >/dev/null 2>&1 || true
             ;;
 
         start)
-            if command -v haproxy >/dev/null 2>&1; then
-                haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 && {
-                    systemctl start haproxy >/dev/null 2>&1 || true
-                }
+            pkill -KILL -f "hipf-gost-udp" >/dev/null 2>&1 || true
+            
+            echo -e "${CYAN}>>> 2. 启动 HAProxy (TCP引擎)...${RESET}"
+            if haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
+                systemctl start haproxy || echo -e "${RED}HAProxy 启动失败 (非致命)${RESET}"
+            else
+                echo -e "${YELLOW}HAProxy 配置校验未通过，面板启动后将自动修复...${RESET}"
+                systemctl start haproxy >/dev/null 2>&1 || true
             fi
-
-            systemctl start "$SERVICE_NAME" || {
-                echo -e "${RED}❌ 启动失败：${RESET}"
-                systemctl status "$SERVICE_NAME" --no-pager -l || true
-                journalctl -u "$SERVICE_NAME" -n 60 --no-pager || true
+            
+            echo -e "${CYAN}>>> 3. 启动面板主程序...${RESET}"
+            systemctl start "$SERVICE_NAME"
+            
+            sleep 2
+            if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+                echo -e "${RED}❌ 启动失败！查看日志：${RESET}"
+                journalctl -u "$SERVICE_NAME" -n 20 --no-pager
                 return 1
-            }
+            fi
             ;;
 
         restart)
-            systemctl restart "$SERVICE_NAME" || {
-                echo -e "${RED}❌ 重启失败：${RESET}"
-                systemctl status "$SERVICE_NAME" --no-pager -l || true
-                journalctl -u "$SERVICE_NAME" -n 60 --no-pager || true
-                return 1
-            }
+            echo -e "${YELLOW}>>> 正在执行 重启 流程...${RESET}"
+            
+            service_control stop
+            
+            echo -e "${YELLOW}>>> 等待端口释放 (2秒)...${RESET}"
+            sleep 2
+            
+            service_control start
             ;;
 
         *)
-            systemctl "$action" "$SERVICE_NAME" || return 1
+            systemctl "$action" "$SERVICE_NAME"
             ;;
     esac
 
-    echo -e "${GREEN}执行完成${RESET}"
-    echo -e "${CYAN}--- 当前状态 ---${RESET}"
-    systemctl is-active "$SERVICE_NAME" || true
-    systemctl show "$SERVICE_NAME" -p MainPID --value 2>/dev/null | sed 's/^/MainPID: /' || true
-    pgrep -ax hipf-panel 2>/dev/null || true
-    pgrep -ax hipf-gost-udp 2>/dev/null || true
-    sleep 1
+    if [ "$action" != "stop" ]; then
+        echo -e "${GREEN}>>> 操作执行完毕。当前进程状态：${RESET}"
+        echo -e "----------------------------------------"
+        if pgrep -x "hipf-panel" >/dev/null; then
+            echo -e "面板进程: ${GREEN}运行中${RESET} (PID: $(pgrep -x hipf-panel))"
+        else
+            echo -e "面板进程: ${RED}未运行${RESET}"
+        fi
+        
+        local UDP_COUNT=$(pgrep -f "hipf-gost-udp" | wc -l)
+        if [ "$UDP_COUNT" -gt 0 ]; then
+            echo -e "UDP 转发: ${GREEN}运行中${RESET} (共 $UDP_COUNT 个进程)"
+        else
+            echo -e "UDP 转发: ${YELLOW}无活跃进程 (或无规则)${RESET}"
+        fi
+        
+        if systemctl is-active --quiet haproxy; then
+            echo -e "TCP 引擎: ${GREEN}运行中${RESET}"
+        else
+            echo -e "TCP 引擎: ${RED}未运行${RESET}"
+        fi
+        echo -e "----------------------------------------"
+    fi
 }
 
 
