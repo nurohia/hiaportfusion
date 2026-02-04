@@ -17,7 +17,6 @@ GOST_PRO_BIN="/usr/local/bin/hipf-gost-udp"
 # 颜色与图标定义
 GREEN="\033[32m"
 RED="\033[31m"
-YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 CHECK_MARK="${GREEN}✔${RESET}"
@@ -28,21 +27,6 @@ CHAIN_IN="HIPF_IN"
 CHAIN_OUT="HIPF_OUT"
 
 # =================基础函数库=================
-
-spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    echo -n " "
-    while [ -d /proc/$pid ]; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "    \b\b\b\b"
-}
 
 task_start() {
     echo -e -n "${CYAN}>>> $1...${RESET}"
@@ -136,7 +120,7 @@ echo -e "${GREEN}==========================================${RESET}"
 install_dependencies
 
 # 2. 生成源码
-task_start "正在生成面板源码"
+task_start "正在生成面板源码 (Rust)"
 mkdir -p "$WORK_DIR/src"
 cd "$WORK_DIR"
 
@@ -144,7 +128,7 @@ cd "$WORK_DIR"
 cat > Cargo.toml <<EOF
 [package]
 name = "hipf-panel"
-version = "1.0.9"
+version = "1.1.3"
 edition = "2021"
 
 [dependencies]
@@ -173,7 +157,8 @@ use chrono::prelude::*;
 
 const DATA_FILE: &str = "/etc/hipf/panel_data.json";
 const HAPROXY_CFG: &str = "/etc/haproxy/haproxy.cfg";
-const GOST_PRO_BIN: &str = "/usr/local/bin/hipf-gost-udp"; // 13 chars, safe for pkill -x
+const GOST_PRO_BIN: &str = "/usr/local/bin/hipf-gost-udp"; 
+const UDP_PID_DIR: &str = "/run/hipf-gost";
 const CHAIN_IN: &str = "HIPF_IN";
 const CHAIN_OUT: &str = "HIPF_OUT";
 
@@ -224,12 +209,117 @@ struct AppState {
     active_token: Mutex<Option<String>>,
 }
 
+
+fn ensure_pid_dir() {
+    let _ = fs::create_dir_all(UDP_PID_DIR);
+}
+
+fn udp_pid_path(rule_id: &str) -> String {
+    format!("{}/hipf_{}.pid", UDP_PID_DIR, rule_id)
+}
+
+fn read_pid(rule_id: &str) -> Option<i32> {
+    let p = udp_pid_path(rule_id);
+    fs::read_to_string(p).ok()?.trim().parse::<i32>().ok()
+}
+
+fn write_pid(rule_id: &str, pid: u32) {
+    let p = udp_pid_path(rule_id);
+    let _ = fs::write(p, pid.to_string());
+}
+
+fn remove_pid(rule_id: &str) {
+    let p = udp_pid_path(rule_id);
+    let _ = fs::remove_file(p);
+}
+
+fn pid_alive(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+fn udp_start_rule(rule: &Rule) {
+    ensure_pid_dir();
+    if !rule.enabled { return; }
+
+    let bind_addr = normalize_addr(&rule.listen);
+    let remote_addr = normalize_addr(&rule.remote);
+    
+    // Check if running
+    if let Some(pid) = read_pid(&rule.id) {
+        if pid_alive(pid) { return; } 
+        remove_pid(&rule.id); 
+    }
+
+    let gost_target = format!("udp://{}/{}", bind_addr, remote_addr);
+    
+    match Command::new(GOST_PRO_BIN) 
+        .arg("-L")
+        .arg(gost_target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn() 
+    {
+        Ok(child) => {
+             write_pid(&rule.id, child.id());
+        },
+        Err(e) => {
+            eprintln!("ERROR: Failed to start UDP rule '{}' ({}): {}", rule.name, rule.listen, e);
+        }
+    }
+}
+
+fn udp_stop_rule(rule_id: &str) {
+    if let Some(pid) = read_pid(rule_id) {
+        if pid_alive(pid) {
+            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+        }
+    }
+    remove_pid(rule_id);
+}
+
+fn udp_stop_all(_: &Vec<Rule>) {
+    ensure_pid_dir();
+    
+    if let Ok(entries) = fs::read_dir(UDP_PID_DIR) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("pid") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(pid) = content.trim().parse::<i32>() {
+                        let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+                    }
+                }
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn udp_start_all(rules: &Vec<Rule>) {
+    ensure_pid_dir();
+    for r in rules {
+        if r.enabled {
+            udp_start_rule(r);
+        }
+    }
+}
+
+
 #[tokio::main]
 async fn main() {
     init_firewall_chains();
     
     let initial_data = load_or_init_data();
-    apply_backend_config(&initial_data.rules);
+    
+    // Startup Sequence
+    apply_backend_config(&initial_data.rules); // TCP
+    
+    // UDP: Directory Sweep Clean (Remove orphans)
+    udp_stop_all(&initial_data.rules); 
+    
+    // UDP: Start valid rules
+    udp_start_all(&initial_data.rules);
 
     let state = Arc::new(AppState {
         data: Mutex::new(initial_data),
@@ -266,7 +356,6 @@ async fn main() {
         .route("/api/rules/:id/reset_traffic", post(reset_traffic))
         .route("/api/admin/account", post(update_account))
         .route("/api/admin/bg", post(update_bg))
-        // 新增：备份与恢复接口
         .route("/api/backup", get(download_backup))
         .route("/api/restore", post(restore_backup))
         .route("/logout", post(logout_action))
@@ -300,7 +389,6 @@ fn get_port(listen: &str) -> String {
 }
 
 fn apply_backend_config(rules: &Vec<Rule>) {
-    // 1. HAProxy (TCP)
     let header = r#"global
     daemon
     maxconn 10240
@@ -327,28 +415,6 @@ defaults
     
     let _ = fs::write(HAPROXY_CFG, config_content);
     let _ = Command::new("systemctl").arg("reload").arg("haproxy").status();
-
-    // 2. GOST (UDP)
-    let _ = Command::new("pkill").arg("-x").arg("hipf-gost-udp").status();
-    std::thread::sleep(Duration::from_millis(100));
-
-    for rule in rules {
-        if rule.enabled {
-            let bind_addr = normalize_addr(&rule.listen);
-            let remote_addr = normalize_addr(&rule.remote);
-            
-            let gost_target = format!("udp://{}/{}", bind_addr, remote_addr);
-            
-            Command::new(GOST_PRO_BIN) 
-                .arg("-L")
-                .arg(gost_target)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok();
-        }
-    }
 }
 
 
@@ -441,7 +507,8 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
     let mut data = state.data.lock().unwrap();
     let now = Utc::now().timestamp_millis() as u64;
     let mut changed = false;
-    let mut need_apply = false;
+    let mut need_apply_haproxy = false;
+    
     for rule in data.rules.iter_mut() {
         if !rule.enabled { continue; }
         let port = get_port(&rule.listen);
@@ -457,23 +524,28 @@ fn update_traffic_and_check(state: &Arc<AppState>) {
         } else {
             last_map.insert(port.clone(), curr);
         }
+        
+        let mut should_stop = false;
         if rule.expire_date > 0 && now > rule.expire_date {
-            rule.enabled = false;
+            should_stop = true;
             rule.status_msg = "已过期".to_string();
-            changed = true;
-            need_apply = true;
-            remove_iptables_rule(rule);
         }
         if rule.traffic_limit > 0 && rule.traffic_used >= rule.traffic_limit {
-            rule.enabled = false;
+            should_stop = true;
             rule.status_msg = "流量耗尽".to_string();
+        }
+        
+        if should_stop {
+            rule.enabled = false;
             changed = true;
-            need_apply = true;
+            need_apply_haproxy = true; // HAProxy needs reload to stop listener
             remove_iptables_rule(rule);
+            udp_stop_rule(&rule.id);   // Stop only this UDP process
         }
     }
+    
     if changed { save_json(&data); }
-    if need_apply { apply_backend_config(&data.rules); }
+    if need_apply_haproxy { apply_backend_config(&data.rules); }
 }
 
 fn load_or_init_data() -> AppData {
@@ -567,9 +639,13 @@ async fn add_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Json(req
         expire_date: req.expire_date, traffic_limit: req.traffic_limit, traffic_used: 0, status_msg: String::new()
     };
     add_iptables_rule(&rule);
-    data.rules.push(rule);
+    data.rules.push(rule.clone());
+    
+    // Config: Start single UDP + Reload HAProxy
+    udp_start_rule(&rule);
     save_json(&data);
-    apply_backend_config(&data.rules); 
+    apply_backend_config(&data.rules);
+    
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
@@ -587,6 +663,7 @@ async fn batch_add_rules(cookies: Cookies, State(state): State<Arc<AppState>>, J
             expire_date: 0, traffic_limit: 0, traffic_used: 0, status_msg: String::new()
         };
         add_iptables_rule(&rule);
+        udp_start_rule(&rule);
         data.rules.push(rule);
         added = true;
     }
@@ -598,6 +675,10 @@ async fn delete_all_rules(cookies: Cookies, State(state): State<Arc<AppState>>) 
     if !check_auth(&cookies, &state) { return StatusCode::UNAUTHORIZED.into_response(); }
     let mut data = state.data.lock().unwrap();
     flush_iptables_chains();
+    
+    // Stop ALL UDP processes (Clean sweep)
+    udp_stop_all(&data.rules);
+    
     data.rules.clear();
     save_json(&data);
     apply_backend_config(&data.rules);
@@ -609,9 +690,16 @@ async fn toggle_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
     let mut data = state.data.lock().unwrap();
     if let Some(rule) = data.rules.iter_mut().find(|r| r.id == id) { 
         rule.enabled = !rule.enabled;
-        if rule.enabled { rule.status_msg = String::new(); add_iptables_rule(rule); } else { remove_iptables_rule(rule); }
+        if rule.enabled { 
+            rule.status_msg = String::new(); 
+            add_iptables_rule(rule);
+            udp_start_rule(rule); // Only start this one
+        } else { 
+            remove_iptables_rule(rule);
+            udp_stop_rule(&rule.id); // Only stop this one
+        }
         save_json(&data);
-        apply_backend_config(&data.rules);
+        apply_backend_config(&data.rules); // Reload HAProxy (TCP needs global reload)
     }
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
@@ -624,8 +712,16 @@ async fn reset_traffic(cookies: Cookies, State(state): State<Arc<AppState>>, Pat
         rule.traffic_used = 0; rule.status_msg = String::new();
         let port = get_port(&rule.listen);
         if !port.is_empty() { last_map.remove(&port); }
-        if rule.enabled { remove_iptables_rule(rule); add_iptables_rule(rule); }
+        
+        if rule.enabled {
+             // Re-ensure iptables and processes are active (in case it was disabled by limit)
+             remove_iptables_rule(rule); 
+             add_iptables_rule(rule);
+             udp_start_rule(rule); // Ensure it's running
+        }
         save_json(&data);
+        // Maybe Apply? If it was disabled by traffic limit, we might need to apply backend config to re-enable TCP.
+        if rule.enabled { apply_backend_config(&data.rules); }
     }
     Json(serde_json::json!({"status":"ok"})).into_response()
 }
@@ -635,6 +731,7 @@ async fn delete_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
     let mut data = state.data.lock().unwrap();
     if let Some(pos) = data.rules.iter().position(|r| r.id == id) {
         remove_iptables_rule(&data.rules[pos]);
+        udp_stop_rule(&data.rules[pos].id); // Stop single UDP process
         data.rules.remove(pos);
     }
     save_json(&data);
@@ -651,13 +748,18 @@ async fn update_rule(cookies: Cookies, State(state): State<Arc<AppState>>, Path(
         return Json(serde_json::json!({"status":"error", "message": "端口占用"})).into_response();
     }
     if let Some(idx) = data.rules.iter().position(|r| r.id == id) {
+        // Stop old UDP
+        udp_stop_rule(&data.rules[idx].id);
         remove_iptables_rule(&data.rules[idx]);
+        
         let rule = &mut data.rules[idx];
         rule.name = req.name; rule.listen = req.listen; rule.remote = req.remote;
         rule.expire_date = req.expire_date; rule.traffic_limit = req.traffic_limit;
+        
         if rule.enabled {
             if rule.status_msg == "流量耗尽" && (req.traffic_limit == 0 || req.traffic_limit > rule.traffic_used) { rule.status_msg = String::new(); }
             add_iptables_rule(rule);
+            udp_start_rule(rule); // Start new UDP config
         }
         save_json(&data);
         apply_backend_config(&data.rules);
@@ -701,16 +803,16 @@ async fn restore_backup(cookies: Cookies, State(state): State<Arc<AppState>>, Js
     let mut data = state.data.lock().unwrap();
     if backup_rules.is_empty() { return Json(serde_json::json!({"status": "error", "message": "导入的数据为空"})).into_response(); }
     
-
     flush_iptables_chains();
-
+    udp_stop_all(&data.rules); // Clean sweep everything
 
     data.rules = backup_rules;
 
-
     save_json(&data);
+    
+    // Apply new configs
     apply_backend_config(&data.rules);
-
+    udp_start_all(&data.rules);
 
     for r in &data.rules { if r.enabled { add_iptables_rule(r); } }
 
@@ -860,6 +962,8 @@ LimitNPROC=1048576
 ExecStart=$PANEL_BIN
 Restart=always
 RestartSec=3
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -880,9 +984,4 @@ fi
 echo -e ""
 echo -e "${GREEN}============================================${RESET}"
 echo -e "${GREEN}      ✅ HiaPortFusion 面板部署成功          ${RESET}"
-echo -e "${GREEN}============================================${RESET}"
-echo -e "访问地址 : ${YELLOW}http://${SHOW_IP}:${PANEL_PORT}${RESET}"
-echo -e "默认用户 : ${YELLOW}${DEFAULT_USER}${RESET}"
-echo -e "默认密码 : ${YELLOW}${DEFAULT_PASS}${RESET}"
-echo -e ""
 echo -e "${GREEN}============================================${RESET}"
